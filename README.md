@@ -1,6 +1,6 @@
 # xcheckfs
 
-xcheckfs is a FUSE file system that validates an *experimental* file system
+xcheckfs (cross-check FS) is a FUSE file system that validates an *experimental* file system
 against a trusted, battle-tested one. `xcheckfs mount /mnt /home /experimental`
 mounts `/home` at `/mnt` and mirrors every operation to `/experimental` in
 lockstep, compares the outcomes, and reports every disagreement. Both
