@@ -11,3 +11,4 @@ Goal-oriented directions for a specific task or problem.
 ## Development
 
 - [Testing](development/TESTING.md) — the test suite
+- [Releasing](development/RELEASING.md) — tag a version; CI tests, builds the static binaries and packages, and publishes the GitHub release

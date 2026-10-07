@@ -678,7 +678,7 @@ fn concurrent_lookup_and_forget_of_the_same_inode() {
                     let mut n = 0u64;
                     while !stop.load(Ordering::Relaxed) {
                         // alternate between the two names of the same inode (same node id)
-                        let p = if (n + t) % 2 == 0 { "/f" } else { "/d/f-link" };
+                        let p = if (n + t).is_multiple_of(2) { "/f" } else { "/d/f-link" };
                         let a = match h.try_lookup(p) {
                             Ok(a) => a,
                             Err(e) => panic!("lookup {p}: {e}"),

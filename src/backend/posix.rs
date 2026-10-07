@@ -201,17 +201,19 @@ impl Backend for PosixBackend {
         newname: &CStr,
         flags: u32,
     ) -> SysResult<()> {
+        // A raw syscall: musl has no renameat2() wrapper.
         // SAFETY: valid fds / C strings.
-        cvt(unsafe {
-            libc::renameat2(
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
                 dir.as_raw_fd(),
                 name.as_ptr(),
                 newdir.as_raw_fd(),
                 newname.as_ptr(),
                 flags,
             )
-        })
-        .map(drop)
+        };
+        if r < 0 { Err(sys::errno()) } else { Ok(()) }
     }
 
     fn link(&self, node: BorrowedFd<'_>, newdir: BorrowedFd<'_>, newname: &CStr) -> SysResult<()> {
@@ -472,10 +474,20 @@ impl Backend for PosixBackend {
     ) -> SysResult<usize> {
         let mut oi = off_in as libc::loff_t;
         let mut oo = off_out as libc::loff_t;
+        // A raw syscall: not every libc (musl) has a wrapper.
         // SAFETY: valid fds and offset pointers.
-        cvt_size(unsafe {
-            libc::copy_file_range(fin.as_raw_fd(), &mut oi, fout.as_raw_fd(), &mut oo, len, flags)
-        })
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                fin.as_raw_fd(),
+                &mut oi as *mut libc::loff_t,
+                fout.as_raw_fd(),
+                &mut oo as *mut libc::loff_t,
+                len,
+                flags,
+            )
+        };
+        if r < 0 { Err(sys::errno()) } else { Ok(r as usize) }
     }
 
     fn getlk(&self, file: BorrowedFd<'_>, lock: &Lock) -> SysResult<Lock> {

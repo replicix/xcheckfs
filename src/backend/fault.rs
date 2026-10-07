@@ -68,7 +68,7 @@ impl Trigger {
             Trigger::Once => n == 1,
             Trigger::Nth(k) => n == k,
             Trigger::After(k) => n > k,
-            Trigger::Every(k) => k > 0 && n % k == 0,
+            Trigger::Every(k) => k > 0 && n.is_multiple_of(k),
         }
     }
 }
@@ -359,11 +359,10 @@ impl FaultBackend {
             if f.op != op {
                 continue;
             }
-            if let Some(n) = &f.name {
-                if !names.iter().any(|x| x == &n.as_slice()) {
+            if let Some(n) = &f.name
+                && !names.iter().any(|x| x == &n.as_slice()) {
                     continue;
                 }
-            }
             if let Some(suffix) = &f.path {
                 let base = base.get_or_insert_with(|| {
                     fd.and_then(sys::fd_path).map(|p| p.as_os_str().as_encoded_bytes().to_vec()).unwrap_or_default()
@@ -409,11 +408,10 @@ impl FaultBackend {
         if let Some(e) = fx.errno_before() {
             return Err(e);
         }
-        if fx.skip() {
-            if let Some(v) = skip_val {
+        if fx.skip()
+            && let Some(v) = skip_val {
                 return Ok(v);
             }
-        }
         let r = call(&fx);
         if let Some(e) = fx.errno_after() {
             return Err(e);

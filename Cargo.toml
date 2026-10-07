@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
 description = "A FUSE file system that mirrors every operation to a reference and an experimental file system in lockstep and reports any disagreement"
-rust-version = "1.85"
+rust-version = "1.88"
+authors = ["Attila Nagy <nagy.attila@gmail.com>"]
+repository = "https://github.com/replicix/xcheckfs"
+readme = "README.md"
+keywords = ["fuse", "filesystem", "testing", "differential", "mirror"]
+categories = ["filesystem", "development-tools::testing"]
 
 [lib]
 name = "xcheckfs"
@@ -28,6 +33,9 @@ crossterm = "0.29"
 fuser = "0.18"
 globset = "0.4"
 libc = "0.2"
+# musl's allocator is slow under multithreaded load; the release binaries
+# are static musl builds.
+mimalloc = { version = "0.1", default-features = false }
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 ratatui = "0.30"
 rayon = "1.10"
@@ -47,3 +55,39 @@ xcheckfs = { path = ".", features = ["fault-injection"] }
 [profile.release]
 debug = 1
 panic = "abort"
+
+# Release binaries (CI): no debug info, stripped, whole-program optimised.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = true
+lto = "thin"
+codegen-units = 1
+
+[package.metadata.deb]
+maintainer = "Attila Nagy <nagy.attila@gmail.com>"
+section = "utils"
+priority = "optional"
+# fusermount3, needed to mount as a non-root user
+depends = "fuse3"
+extended-description = """\
+xcheckfs mounts a trusted directory and mirrors every file system operation \
+to a directory on an experimental file system in lockstep, compares the \
+results, and reports (and by default repairs) every disagreement. \
+Applications always get the trusted file system's results."""
+assets = [
+    ["target/release/xcheckfs", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/xcheckfs/README.md", "644"],
+    ["LICENSE", "usr/share/doc/xcheckfs/LICENSE", "644"],
+]
+
+[package.metadata.generate-rpm]
+license = "MPL-2.0"
+assets = [
+    { source = "target/release/xcheckfs", dest = "/usr/bin/xcheckfs", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/xcheckfs/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/xcheckfs/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+fuse3 = "*"

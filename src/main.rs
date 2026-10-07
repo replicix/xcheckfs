@@ -17,6 +17,11 @@ use xcheckfs::policy::{Policy, RulesFile};
 use xcheckfs::stats::Stats;
 use xcheckfs::{daemon, logging, sys, tui};
 
+// The release binaries are static musl builds, whose allocator scales
+// poorly across the FUSE worker threads.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Mirror a trusted file system and an experimental one in lockstep and
 /// report every disagreement.
 #[derive(Parser)]
@@ -338,14 +343,13 @@ fn cmd_mount(a: MountArgs) -> anyhow::Result<i32> {
         ("control socket", &a.control_socket),
         ("quarantine directory", &a.quarantine),
     ] {
-        if let Some(p) = p {
-            if inside_trees(p) {
+        if let Some(p) = p
+            && inside_trees(p) {
                 bail!(
                     "{what} {} is inside a mirrored tree: writing it would bypass xcheckfs (divergence) or deadlock while frozen",
                     p.display()
                 );
             }
-        }
     }
     if a.ui == Ui::Tui && a.background {
         bail!("--ui tui cannot be combined with --background");

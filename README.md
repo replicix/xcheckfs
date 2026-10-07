@@ -16,14 +16,33 @@ applications always get the primary's results. The **secondary** (the
 experimental one) only receives a copy of every operation, and whatever it
 does differently is a finding, not an outage.
 
-## Quick start
+## Install
 
-Requirements: Linux, Rust 1.85 or newer, and the FUSE 3 user-space tools
-(`fusermount3`).
+xcheckfs runs on Linux (x86_64 and aarch64). Each
+[release](https://github.com/replicix/xcheckfs/releases) has a static binary
+that runs on any distribution, plus `.deb` and `.rpm` packages. Mounting as a
+non-root user also needs `fusermount3` (package `fuse3`; the packages depend
+on it).
 
 ```bash
-cargo build --release            # binary: target/release/xcheckfs
+# static binary, to /usr/local/bin (root) or ~/.local/bin
+curl -fsSL https://github.com/replicix/xcheckfs/releases/latest/download/install.sh | sh
 
+# or a package, e.g. on Debian/Ubuntu or Fedora/RHEL
+sudo apt install ./xcheckfs_*_amd64.deb
+sudo dnf install ./xcheckfs-*.x86_64.rpm
+
+# or from source (Rust 1.88 or newer)
+cargo build --release            # binary: target/release/xcheckfs
+```
+
+While the repository is private, download with an authenticated GitHub CLI:
+`gh release download -R replicix/xcheckfs -p install.sh -O - | sh` (the
+script then uses `gh` too).
+
+## Quick start
+
+```bash
 # 1. Make both trees identical, and prove it.
 rsync -aHAX --numeric-ids /home/ /experimental/
 xcheckfs verify /home /experimental

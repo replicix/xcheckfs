@@ -675,8 +675,8 @@ impl Engine {
         // POSIX does not require a ctime update when the last link is removed (tmpfs does it, ZFS does not):
         // the ctime of a file without links is not comparable. The baseline above is still refreshed.
         let unlinked = p.nlink == 0 && s.nlink == 0;
-        if let (Some(prev), false) = (prev, unlinked) {
-            if let Some(d) = compare::ctime_change(prev, (p.ctime, s.ctime), rules.time_tolerance) {
+        if let (Some(prev), false) = (prev, unlinked)
+            && let Some(d) = compare::ctime_change(prev, (p.ctime, s.ctime), rules.time_tolerance) {
                 self.report(
                     cx,
                     node,
@@ -688,7 +688,6 @@ impl Engine {
                     excl,
                 )?;
             }
-        }
         Ok(())
     }
 

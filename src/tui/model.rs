@@ -133,6 +133,7 @@ pub fn utc_hms(secs: u64) -> (u32, u32, u32) {
 }
 
 fn local_hms(secs: u64) -> Option<(u32, u32, u32)> {
+    #[allow(deprecated)] // libc's time_t note about musl < 1.2; Rust's musl is 64-bit time
     let t = secs as libc::time_t;
     // SAFETY: `tm` is plain old data and `localtime_r` only writes into it.
     let tm = unsafe {

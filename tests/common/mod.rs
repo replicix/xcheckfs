@@ -856,11 +856,10 @@ pub fn tree_diff(a: &Path, b: &Path, o: &TreeOpts) -> Vec<String> {
         if (!ft.is_dir() || o.dir_nlink) && ma.nlink() != mb.nlink() {
             d.push(format!("{name}: nlink {} vs {}", ma.nlink(), mb.nlink()));
         }
-        if let Some(tol) = o.mtime {
-            if (ma.mtime() - mb.mtime()).unsigned_abs() > tol.as_secs() {
+        if let Some(tol) = o.mtime
+            && (ma.mtime() - mb.mtime()).unsigned_abs() > tol.as_secs() {
                 d.push(format!("{name}: mtime {} vs {}", ma.mtime(), mb.mtime()));
             }
-        }
         if (ft.is_char_device() || ft.is_block_device()) && ma.rdev() != mb.rdev() {
             d.push(format!("{name}: rdev differs"));
         }

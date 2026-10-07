@@ -79,8 +79,8 @@ impl Engine {
             tracing::error!("node {id} identity changed on the primary; refusing");
             return Err(Fail::Errno(libc::EIO));
         }
-        if let (Some(a), Some((_, sst))) = (n.sident(), &s) {
-            if a != sst.ident() {
+        if let (Some(a), Some((_, sst))) = (n.sident(), &s)
+            && a != sst.ident() {
                 self.report_at(
                     cx,
                     parent,
@@ -93,7 +93,6 @@ impl Engine {
                     false,
                 )?;
             }
-        }
         if let Some((sfd, sst)) = s {
             if n.has_sec() {
                 self.cmp_stat(cx, n, pst, &sst, excl, cx_what(cx.op))?;
@@ -149,8 +148,8 @@ impl Engine {
             }
             return Ok((n, attr));
         }
-        if let Some((_, sst)) = &s {
-            if let Some(other) = self.secondary_claimed_by_other(sst.ident(), id) {
+        if let Some((_, sst)) = &s
+            && let Some(other) = self.secondary_claimed_by_other(sst.ident(), id) {
                 let other_path = self.nodes.get(other).map(|o| self.path_of(&o)).unwrap_or_default();
                 self.report_at(
                     cx,
@@ -164,7 +163,6 @@ impl Engine {
                     false,
                 )?;
             }
-        }
         let (sfd, sident, sst) = match s {
             Some((fd, st)) => (Some(fd), Some(st.ident()), Some(st)),
             None => (None, None, None),
@@ -373,16 +371,14 @@ impl Engine {
                         if a.size.is_some_and(|z| z != st.size) {
                             bad.push(format!("size {} != requested {}", st.size, a.size.unwrap()));
                         }
-                        if let Some(TimeSpec::Set(t)) = a.mtime {
-                            if st.mtime != t {
+                        if let Some(TimeSpec::Set(t)) = a.mtime
+                            && st.mtime != t {
                                 bad.push(format!("mtime {} != requested {t}", st.mtime));
                             }
-                        }
-                        if let Some(TimeSpec::Set(t)) = a.atime {
-                            if st.atime != t {
+                        if let Some(TimeSpec::Set(t)) = a.atime
+                            && st.atime != t {
                                 bad.push(format!("atime {} != requested {t}", st.atime));
                             }
-                        }
                         if bad.is_empty() { Ok(()) } else { Err(bad.join(", ")) }
                     };
                     self.verify_sides(cx, &n, None, "setattr applied", check(&pst), Some(check(sst)), true)?;
@@ -400,8 +396,8 @@ impl Engine {
             let (p, s) = self.both(cx, sec, None, |side, be| be.readlink(n.fd(side).as_fd()));
             self.cmp_result(cx, &n, None, &p, &s, false)?;
             let pt = p?;
-            if let Some(Ok(st)) = &s {
-                if &pt != st {
+            if let Some(Ok(st)) = &s
+                && &pt != st {
                     self.report(
                         cx,
                         &n,
@@ -413,7 +409,6 @@ impl Engine {
                         false,
                     )?;
                 }
-            }
             Ok(pt)
         })
     }
@@ -526,14 +521,13 @@ impl Engine {
             self.verify_sides(cx, &pn, Some(name), "removed", chk(gp), gs.map(chk), true)?;
             // The object itself may live on (hard links, open files): its
             // link count and ctime must have changed the same way.
-            if let Some(child) = cands[0].and_then(|st| self.nodes.get(self.map_ino(st.ino))) {
-                if self.sec_for(&[&child]) {
+            if let Some(child) = cands[0].and_then(|st| self.nodes.get(self.map_ino(st.ino)))
+                && self.sec_for(&[&child]) {
                     let (a, b) = self.both(cx, true, None, |side, be| be.stat(child.fd(side).as_fd()));
                     if let (Ok(a), Some(Ok(b))) = (a, b) {
                         self.cmp_stat(cx, &child, &a, &b, true, "after remove")?;
                     }
                 }
-            }
         }
         self.compare_listing(cx, &pn, "parent after remove")?;
         Ok(())
@@ -592,11 +586,10 @@ impl Engine {
                 if let Some(src) = cands[0].and_then(|st| self.nodes.get(self.map_ino(st.ino))) {
                     src.set_hint(Engine::child_hint(&npn, newname));
                 }
-                if flags & libc::RENAME_EXCHANGE != 0 {
-                    if let Some(dst) = cands[1].and_then(|st| self.nodes.get(self.map_ino(st.ino))) {
+                if flags & libc::RENAME_EXCHANGE != 0
+                    && let Some(dst) = cands[1].and_then(|st| self.nodes.get(self.map_ino(st.ino))) {
                         dst.set_hint(Engine::child_hint(&pn, name));
                     }
-                }
                 if let (Some((pp, ps)), true) = (pre, matches!(s, Some(Ok(())))) {
                     let (ap, as_) = self.both(cx, true, None, |side, be| {
                         Ok((
@@ -616,14 +609,13 @@ impl Engine {
                     };
                     let ps = ps.unwrap();
                     self.verify_sides(cx, &pn, Some(name), "renamed", chk(pp, ap.unwrap()), Some(chk(ps, as_.unwrap().unwrap())), true)?;
-                    if let Some(src) = cands[0].and_then(|st| self.nodes.get(self.map_ino(st.ino))) {
-                        if self.sec_for(&[&src]) {
+                    if let Some(src) = cands[0].and_then(|st| self.nodes.get(self.map_ino(st.ino)))
+                        && self.sec_for(&[&src]) {
                             let (a, b) = self.both(cx, true, None, |side, be| be.stat(src.fd(side).as_fd()));
                             if let (Ok(a), Some(Ok(b))) = (a, b) {
                                 self.cmp_stat(cx, &src, &a, &b, true, "after rename")?;
                             }
                         }
-                    }
                 }
                 cx.resync_extra = None;
                 self.compare_listing(cx, &pn, "source dir after rename")?;
@@ -751,11 +743,10 @@ impl Engine {
                 Some(Ok(sn)) => Some(*sn),
                 _ => None,
             };
-            if let Some(sn) = sn {
-                if sn != pn {
+            if let Some(sn) = sn
+                && sn != pn {
                     self.report(cx, n, MismatchKind::Length, None, pn.to_string(), sn.to_string(), format!("write at offset {off}, {} bytes", data.len()), true)?;
                 }
-            }
             if self.thorough() && sn.is_some() && n.has_sec() {
                 let append = f.flags & libc::O_APPEND != 0;
                 let (a, b) = self.both(cx, true, None, |side, be| {
@@ -868,8 +859,8 @@ impl Engine {
             let (p, s) = self.both(cx, sec, None, |side, be| be.lseek(f.fd(side).as_fd(), off, whence));
             self.cmp_result(cx, n, None, &p, &s, false)?;
             let po = p?;
-            if let Some(Ok(so)) = s {
-                if so != po {
+            if let Some(Ok(so)) = s
+                && so != po {
                     if whence == libc::SEEK_DATA || whence == libc::SEEK_HOLE {
                         // Hole detection granularity is file-system specific.
                         tracing::debug!("lseek {whence} differs: {po} vs {so} (not a mismatch)");
@@ -877,7 +868,6 @@ impl Engine {
                         self.report(cx, n, MismatchKind::Length, Some("offset".into()), po.to_string(), so.to_string(), String::new(), false)?;
                     }
                 }
-            }
             Ok(po)
         })
     }
@@ -1076,11 +1066,10 @@ impl Engine {
             let (p, s) = self.both(cx, sec, None, |side, be| be.getxattr(n.fd(side).as_fd(), &c, size as usize));
             self.cmp_result(cx, &n, None, &p, &s, false)?;
             let pv = p?;
-            if let Some(Ok(sv)) = &s {
-                if &pv != sv {
+            if let Some(Ok(sv)) = &s
+                && &pv != sv {
                     self.report(cx, &n, MismatchKind::Xattr, Some(name.to_string_lossy().into_owned()), xattr_desc(&pv), xattr_desc(sv), String::new(), false)?;
                 }
-            }
             Ok(pv)
         })
     }

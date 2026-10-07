@@ -251,13 +251,11 @@ impl NodeTable {
     }
 
     fn remove(g: &mut Inner, id: u64) {
-        if let Some(n) = g.by_id.remove(&id) {
-            if let Some(si) = n.sident() {
-                if g.by_sec.get(&si) == Some(&id) {
+        if let Some(n) = g.by_id.remove(&id)
+            && let Some(si) = n.sident()
+                && g.by_sec.get(&si) == Some(&id) {
                     g.by_sec.remove(&si);
                 }
-            }
-        }
     }
 
     /// Replaces (or removes, or attaches) the secondary object of a node.

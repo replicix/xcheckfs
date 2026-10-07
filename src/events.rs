@@ -58,10 +58,9 @@ impl EventSink {
 
     /// Never blocks: a slow UI must not slow the file system down.
     pub fn send(&self, ev: UiEvent, stats: &Stats) {
-        if let Some(tx) = &self.tx {
-            if let Err(TrySendError::Full(_)) = tx.try_send(ev) {
+        if let Some(tx) = &self.tx
+            && let Err(TrySendError::Full(_)) = tx.try_send(ev) {
                 stats.events_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-        }
     }
 }

@@ -1,0 +1,121 @@
+name: Release
+
+# Push a tag `vX.Y.Z` matching the version in Cargo.toml: the tests run, the
+# static Linux binaries and packages are built, and a GitHub release with all
+# of them (plus install.sh and SHA256SUMS) is published.
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  # Each target is built natively on a runner of its architecture.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    env:
+      # musl C compiler for mimalloc
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Check that the tag matches the crate version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "xcheckfs") | .version')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      # A clean (uncached) build. A static musl binary: runs on any Linux distribution.
+      - name: Build
+        run: cargo build --locked --profile dist --target ${{ matrix.target }}
+
+      - name: Smoke test
+        run: |
+          bin=target/${{ matrix.target }}/dist/xcheckfs
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          out=$("$bin" --version)
+          echo "$out"
+          [ "$out" = "xcheckfs $VERSION" ]
+
+      - name: Package
+        run: |
+          t=${{ matrix.target }}
+          mkdir -p out "stage/xcheckfs-$t"
+          cp "target/$t/dist/xcheckfs" README.md LICENSE "stage/xcheckfs-$t/"
+          # version-less name: .../releases/latest/download/<name> works
+          tar -C stage -cJf "out/xcheckfs-$t.tar.xz" "xcheckfs-$t"
+          cargo deb --no-build --no-strip --target "$t" --profile dist --output out/
+          cargo generate-rpm --target "$t" --profile dist -o out/
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: out
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cp install.sh out/
+          cd out
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=
+          case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --verify-tag $prerelease \
+            --title "xcheckfs $GITHUB_REF_NAME" \
+            --generate-notes

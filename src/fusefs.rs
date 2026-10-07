@@ -101,11 +101,10 @@ impl Filesystem for XcheckFs {
             want |= InitFlags::FUSE_POSIX_LOCKS;
         }
         for flag in [InitFlags::FUSE_PARALLEL_DIROPS, InitFlags::FUSE_POSIX_LOCKS] {
-            if want.contains(flag) {
-                if let Err(missing) = config.add_capabilities(flag) {
+            if want.contains(flag)
+                && let Err(missing) = config.add_capabilities(flag) {
                     tracing::warn!("kernel does not support {missing:?}");
                 }
-            }
         }
         let _ = config.set_max_write(1 << 20);
         let _ = config.set_time_granularity(Duration::from_nanos(1));

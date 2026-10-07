@@ -132,11 +132,10 @@ pub fn diff_dir(p: &[DirEntry], s: &[DirEntry]) -> DirDiff {
     while i < a.len() || j < b.len() {
         match (a.get(i), b.get(j)) {
             (Some(x), Some(y)) if x.name == y.name => {
-                if let (Some(kx), Some(ky)) = (x.kind, y.kind) {
-                    if kx != ky {
+                if let (Some(kx), Some(ky)) = (x.kind, y.kind)
+                    && kx != ky {
                         d.type_differs.push(x.name.clone());
                     }
-                }
                 i += 1;
                 j += 1;
             }

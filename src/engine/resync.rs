@@ -245,31 +245,27 @@ impl Engine {
                 let Ok(c) = CString::new(ent.name) else { continue };
                 if ent.ino == pst.ino {
                     names.push((idx, c));
-                } else if ent.kind.is_none_or(|k| k == FileKind::Dir) {
-                    if let (Ok((cp, st)), Ok((cs, sst))) = (p.lookup(pd.as_fd(), &c), s.lookup(sd.as_fd(), &c)) {
-                        if st.kind() == FileKind::Dir && sst.kind() == FileKind::Dir {
+                } else if ent.kind.is_none_or(|k| k == FileKind::Dir)
+                    && let (Ok((cp, st)), Ok((cs, sst))) = (p.lookup(pd.as_fd(), &c), s.lookup(sd.as_fd(), &c))
+                        && st.kind() == FileKind::Dir && sst.kind() == FileKind::Dir {
                             queue.push_back((cp, cs));
                         }
-                    }
-                }
             }
             dirs.push((pd, sd));
         }
         // the secondary inode all the names must lead to: the node's own, unless it is gone
         let mut target = None;
-        if let Some(nfd) = n.try_s() {
-            if let Ok(fd) = crate::sys::dup(nfd.as_fd()) {
+        if let Some(nfd) = n.try_s()
+            && let Ok(fd) = crate::sys::dup(nfd.as_fd()) {
                 target = s.stat(fd.as_fd()).ok().filter(|st| st.nlink > 0 && st.kind() == pst.kind()).map(|st| (fd, st));
             }
-        }
         if target.is_none() {
             for (i, c) in &names {
-                if let Ok((fd, st)) = s.lookup(dirs[*i].1.as_fd(), c) {
-                    if st.kind() == pst.kind() {
+                if let Ok((fd, st)) = s.lookup(dirs[*i].1.as_fd(), c)
+                    && st.kind() == pst.kind() {
                         target = Some((fd, st));
                         break;
                     }
-                }
             }
         }
         let (tfd, tst) = target.ok_or("no secondary object to link the names to")?;
@@ -433,12 +429,11 @@ impl Engine {
         let mut changed = false;
         match &sl {
             Some((fd, sst)) if sst.kind() == n.kind => {
-                if n.sident() != Some(sst.ident()) {
-                    if let Ok(fd) = crate::sys::dup(fd.as_fd()) {
+                if n.sident() != Some(sst.ident())
+                    && let Ok(fd) = crate::sys::dup(fd.as_fd()) {
                         self.nodes.set_secondary(&n, Some((fd, sst.ident())));
                         changed = true;
                     }
-                }
             }
             // (only the entries named by the repair are locked: below them, a secondary is replaced but never taken
             // away, because operations that hold the node's lock rely on it)
@@ -524,19 +519,16 @@ impl Engine {
                 }
                 let Ok(c) = CString::new(ent.name) else { continue };
                 if ent.ino == ino {
-                    if let Ok((fd, st)) = s.lookup(sd.as_fd(), &c) {
-                        if st.kind() == kind && p.stat_at(pd.as_fd(), &c).is_ok_and(|x| x.ino == ino)
+                    if let Ok((fd, st)) = s.lookup(sd.as_fd(), &c)
+                        && st.kind() == kind && p.stat_at(pd.as_fd(), &c).is_ok_and(|x| x.ino == ino)
                         {
                             return Some(fd);
                         }
-                    }
-                } else if ent.kind.is_none_or(|k| k == FileKind::Dir) {
-                    if let (Ok((cp, st)), Ok((cs, _))) = (p.lookup(pd.as_fd(), &c), s.lookup(sd.as_fd(), &c)) {
-                        if st.kind() == FileKind::Dir {
+                } else if ent.kind.is_none_or(|k| k == FileKind::Dir)
+                    && let (Ok((cp, st)), Ok((cs, _))) = (p.lookup(pd.as_fd(), &c), s.lookup(sd.as_fd(), &c))
+                        && st.kind() == FileKind::Dir {
                             queue.push_back((cp, cs));
                         }
-                    }
-                }
             }
         }
         None
@@ -676,11 +668,10 @@ impl Engine {
                 break Ok(());
             }
             let same = matches!(s.pread(sf.as_fd(), &mut b[..k], off), Ok(j) if j == k && a[..k] == b[..k]);
-            if !same {
-                if let Err(x) = write_all(s, sf.as_fd(), &a[..k], off) {
+            if !same
+                && let Err(x) = write_all(s, sf.as_fd(), &a[..k], off) {
                     break Err(x);
                 }
-            }
             off += k as u64;
         };
         self.bufs.put(a);
@@ -697,19 +688,17 @@ impl Engine {
         if let (Ok(XattrOut::Data(pl)), Ok(XattrOut::Data(sl))) = (p.listxattr(pfd, XATTR_MAX), s.listxattr(sfd, XATTR_MAX)) {
             let pn = compare::xattr_names(&pl);
             for name in compare::xattr_names(&sl) {
-                if !pn.contains(&name) {
-                    if let Ok(c) = crate::sys::cstr(name) {
+                if !pn.contains(&name)
+                    && let Ok(c) = crate::sys::cstr(name) {
                         let _ = s.removexattr(sfd, &c);
                     }
-                }
             }
             for name in pn {
                 let Ok(c) = crate::sys::cstr(name) else { continue };
-                if let Ok(XattrOut::Data(v)) = p.getxattr(pfd, &c, XATTR_MAX) {
-                    if s.getxattr(sfd, &c, XATTR_MAX).ok() != Some(XattrOut::Data(v.clone())) {
+                if let Ok(XattrOut::Data(v)) = p.getxattr(pfd, &c, XATTR_MAX)
+                    && s.getxattr(sfd, &c, XATTR_MAX).ok() != Some(XattrOut::Data(v.clone())) {
                         let _ = s.setxattr(sfd, &c, &v, 0);
                     }
-                }
             }
         }
         let _ = s.chown(sfd, Some(pst.uid), Some(pst.gid));
@@ -778,11 +767,10 @@ impl Engine {
                 if pst.kind() != sst.kind() {
                     return Err("type still differs".into());
                 }
-                if let Some(si) = self.nodes.get(self.map_ino(pst.ino)).and_then(|n| n.sident()) {
-                    if si != sst.ident() {
+                if let Some(si) = self.nodes.get(self.map_ino(pst.ino)).and_then(|n| n.sident())
+                    && si != sst.ident() {
                         return Err("hard-link identity still differs".into());
                     }
-                }
                 self.verify_objects(pfd.as_fd(), sfd.as_fd(), pst.kind())
             }
         }

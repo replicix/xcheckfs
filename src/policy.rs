@@ -182,11 +182,10 @@ struct CompiledRule {
 
 impl CompiledRule {
     fn new(rule: Rule) -> anyhow::Result<CompiledRule> {
-        if let Some(op) = &rule.op {
-            if op != "*" && OpKind::from_name(op).is_none() {
+        if let Some(op) = &rule.op
+            && op != "*" && OpKind::from_name(op).is_none() {
                 anyhow::bail!("unknown op {op:?} in rule");
             }
-        }
         let path = match &rule.path {
             Some(p) => Some(Glob::new(p)?.compile_matcher()),
             None => None,

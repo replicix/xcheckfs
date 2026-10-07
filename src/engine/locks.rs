@@ -173,12 +173,11 @@ impl Engine {
             });
             self.cmp_result(cx, &n, None, &p, &s, false)?;
             let mut pl = p?;
-            if let Some(Ok(sl)) = s {
-                if (pl.typ, pl.start, pl.len) != (sl.typ, sl.start, sl.len) {
+            if let Some(Ok(sl)) = s
+                && (pl.typ, pl.start, pl.len) != (sl.typ, sl.start, sl.len) {
                     let d = |x: &Lock| format!("type {} {}+{}", x.typ, x.start, x.len);
                     self.report(cx, &n, MismatchKind::Lock, Some("getlk".into()), d(&pl), d(&sl), String::new(), false)?;
                 }
-            }
             drop(st);
             if pl.typ == libc::F_UNLCK {
                 pl.start = l.start;

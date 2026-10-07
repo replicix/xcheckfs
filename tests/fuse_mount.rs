@@ -93,11 +93,10 @@ impl Drop for Mount {
     fn drop(&mut self) {
         // never leave operations blocked in a freeze: unmounting would hang
         self.h.policy.set_mode(MismatchMode::Log);
-        if let Some(s) = self.session.take() {
-            if s.umount_and_join().is_err() {
+        if let Some(s) = self.session.take()
+            && s.umount_and_join().is_err() {
                 let _ = std::process::Command::new("fusermount3").arg("-uz").arg(&self.mnt).status();
             }
-        }
         if let Some(mut w) = self.watchdog.take() {
             drop(w.stdin.take()); // EOF: the watchdog exits quietly
             let _ = w.wait();
@@ -876,7 +875,8 @@ fn fs_random(m: &Mount, seed: u64, ops: usize, xattrs: bool) {
                 let _ = fs::set_permissions(&p, fs::Permissions::from_mode(*rng.pick(&[0o644, 0o600, 0o755, 0o444])));
             }
             14 => {
-                let d = m.p(rng.pick(&dirs));
+                let dir = *rng.pick(&dirs);
+                let d = m.p(dir);
                 if let Ok(rd) = fs::read_dir(d) {
                     for e in rd.flatten() {
                         let _ = e.metadata();

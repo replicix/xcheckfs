@@ -177,7 +177,9 @@ impl Stat {
             dev: s.st_dev,
             ino: s.st_ino,
             mode: s.st_mode,
-            nlink: s.st_nlink,
+            // u32 on some architectures (aarch64), u64 on others
+            #[allow(clippy::useless_conversion)]
+            nlink: u64::from(s.st_nlink),
             uid: s.st_uid,
             gid: s.st_gid,
             rdev: s.st_rdev,

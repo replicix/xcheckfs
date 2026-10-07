@@ -224,11 +224,10 @@ fn freeze_retry_that_still_mismatches_freezes_again() {
     // the retry mismatches again and must freeze again (not be swallowed as a repeat)
     let t0 = std::time::Instant::now();
     let id2 = loop {
-        if let Some(p) = h.policy.pending().first() {
-            if p.mismatch.id != id1 {
+        if let Some(p) = h.policy.pending().first()
+            && p.mismatch.id != id1 {
                 break p.mismatch.id;
             }
-        }
         assert!(t0.elapsed() < Duration::from_secs(10), "did not freeze again");
         std::thread::sleep(Duration::from_millis(2));
     };
