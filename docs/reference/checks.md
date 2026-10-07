@@ -1,0 +1,130 @@
+# Checks
+
+What xcheckfs compares for each operation, per check level
+(`--check basic|thorough|paranoid`). Levels are cumulative: `thorough`
+includes `basic`, `paranoid` includes `thorough`. How the engine runs and
+compares: [Design](../explanation/DESIGN.md#what-an-operation-does).
+
+## Table of Contents
+
+- [Everywhere](#everywhere)
+- [Per operation](#per-operation)
+- [Attributes](#attributes)
+- [Never compared](#never-compared)
+- [Mismatch kinds](#mismatch-kinds)
+
+## Everywhere
+
+Every operation first compares the **result code** of both sides: success or
+the same errno. A different outcome is a `result` mismatch (`primary=ENOENT
+secondary=OK`). Errno names are those of `errno(3)`; `ENOTSUP` is reported as
+`EOPNOTSUPP`. If both sides fail with the same errno nothing further is
+compared. Where a *verification* (a `thorough` read-back) fails on both sides,
+only a warning is logged: both agree, and the primary is trusted.
+
+## Per operation
+
+| Operation | basic | thorough adds | paranoid adds |
+|---|---|---|---|
+| `lookup` | result; attributes of the entry; hard-link identity; ctime change | | |
+| `getattr` | result; attributes; ctime change | | |
+| `setattr` (chmod, chown, truncate, utimens) | result of each step; attributes afterwards | requested mode, uid, gid, size, atime and mtime are really applied on each side (setgid may be dropped) | |
+| `readlink` | result; link target | | |
+| `mknod`, `mkdir`, `create` | result; attributes of the new entry; identity | | parent listing |
+| `symlink` | as above | link target equals the requested one | parent listing |
+| `link` | result; attributes of the new name (incl. `nlink`); identity | | listing of the target directory |
+| `unlink`, `rmdir` | result | the name is gone on both sides; attributes of the removed object if it lives on (`nlink`, ctime change) | parent listing |
+| `rename` | result | identity of source and destination names before and after is as the flags require (move, replace, exchange); attributes of the moved object | listings of source and target directory |
+| `open` | result | with `O_TRUNC`: size is 0 | |
+| `read` | result; length; data (byte for byte) | | |
+| `write` | result; bytes written | the written range read back equals the written data (honors `O_APPEND`) | |
+| `release` | | | if the file was written: complete content comparison |
+| `fallocate` | result | attributes afterwards; for punch-hole and zero-range: the range reads as zeros (at most 16 MiB checked) | |
+| `copy_file_range` | result; bytes copied | the copied range read back is equal (at most 16 MiB checked) | |
+| `lseek` | result; offset (not for `SEEK_DATA`/`SEEK_HOLE`) | | |
+| `opendir` | result | | |
+| `readdir` | result; the listing at offset 0, as a set of (name, type) | | |
+| `setxattr` | result | the value reads back equal | |
+| `getxattr` | result; value (byte for byte) | | |
+| `listxattr` | result; set of names | | |
+| `removexattr` | result | the attribute is gone (`ENODATA`) | |
+| `access` | result (with the caller's credentials) | | |
+| `getlk`, `setlk` | grant or conflict; for `getlk` the type and range of the conflicting lock | | |
+| `flush`, `fsync`, `fsyncdir`, `statfs` | result only | | |
+
+`readdir` listings are compared as sets: order is file-system specific, and a
+type reported as unknown (`DT_UNKNOWN`) matches any type. At `paranoid`, the
+parent listing is compared after `create`, `mkdir`, `mknod`, `symlink`,
+`link`, `unlink`, `rmdir` and `rename`; "written" means any `write`,
+`fallocate` or `copy_file_range` on the open file.
+
+## Attributes
+
+Compared (same type required; on a type difference nothing else is compared):
+
+| Field | Note |
+|---|---|
+| `type` | regular, directory, symlink, fifo, socket, char/block device |
+| `mode` | permission bits including setuid, setgid, sticky (`07777`) |
+| `uid`, `gid` | |
+| `size` | not for directories |
+| `nlink` | for directories only unless `--no-dir-nlink` |
+| `rdev` | device nodes only |
+| `mtime` | within `--time-tolerance` (default 1 s) plus the object's slack, see below; directories too |
+| `ctime` | as a *change*, see below |
+
+**ctime** is not compared as a value (absolute values differ after any copy).
+xcheckfs remembers the last ctime pair of each object and reports `attr ctime`
+("ctime changed on one side only") when one side's ctime moved by more than
+`--time-tolerance` while the other did not move at all. The same happens when
+a secondary is modified behind xcheckfs's back
+([Limitations](limitations.md#exclusive-access)).
+
+**Slack.** Each file system stamps a changed object's times somewhere inside
+the execution window of the operation (from the common start to the later of
+the two halves). When that window is wider than a tenth of
+`--time-tolerance` (a slow secondary, a saturated machine), it is remembered
+for every object the operation changed, also after the kernel forgets the
+object, and added to the tolerance of its mtime and ctime checks. A slow
+experimental file system therefore never causes timestamp false positives;
+it only loosens timestamp checks for the objects it was slow on.
+
+## Never compared
+
+| What | Why |
+|---|---|
+| `dev`, `ino` | file-system specific |
+| `blocks`, `blksize` | allocation specific |
+| `atime` | depends on mount options (`noatime`, `relatime`) |
+| size of directories | format specific |
+| absolute `ctime` | see above |
+| `statfs` values | capacities differ by nature; only the result is compared |
+| order of directory entries and of xattr names | file-system specific |
+| `SEEK_DATA` / `SEEK_HOLE` offsets | hole granularity is file-system specific |
+| pid of a conflicting lock | always reported as 0 |
+| `fsync` durability | not observable ([Limitations](limitations.md#not-covered)) |
+
+## Mismatch kinds
+
+The `kind` of a mismatch, as used in logs, the [control protocol](control-protocol.md)
+and [allow rules](rules.md).
+
+| Kind | Meaning |
+|---|---|
+| `result` | Success or errno differs. |
+| `attr` | A returned attribute differs; `field` names it (`mode`, `uid`, `gid`, `size`, `nlink`, `rdev`, `mtime`, `ctime`, `type`). |
+| `data` | Returned data differs. |
+| `length` | A returned length, count or offset differs (`read`, `write`, `copy_file_range`, `lseek`). |
+| `readdir` | Directory listings differ. |
+| `readlink` | Symlink targets differ. |
+| `xattr` | Extended attribute value or name list differs; `field` is the attribute name or `list`. |
+| `identity` | Hard-link structure differs: the primary says two names are one inode, the secondary disagrees (or the reverse). |
+| `verify` | A `thorough` read-back shows the mutation was not applied as requested; `field` names the step (`write read-back`, `setattr applied`, `removed`, `renamed`, `truncated`, `symlink target`, `zeroed range`, `copied range`, `xattr set`, `xattr removed`). |
+| `content` | Whole-file content differs on close (`paranoid`). |
+| `lock` | Lock grant/deny or the conflicting lock differs. |
+
+A mismatch is *retryable* when its operation is read-only (`lookup`,
+`getattr`, `readlink`, `read`, `readdir`, `getxattr`, `listxattr`, `access`,
+`statfs`, `lseek`, `getlk`) and *resyncable* unless it is of kind `lock`,
+comes from `lseek` or `statfs`, or concerns an object that does not exist on
+the secondary ([Design](../explanation/DESIGN.md#repair-resync)).

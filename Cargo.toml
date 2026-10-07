@@ -1,0 +1,49 @@
+[package]
+name = "xcheckfs"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "A FUSE file system that mirrors every operation to a reference and an experimental file system in lockstep and reports any disagreement"
+rust-version = "1.85"
+
+[lib]
+name = "xcheckfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xcheckfs"
+path = "src/main.rs"
+
+[features]
+default = []
+# Exposes the fault-injecting backend (`backend::fault`) outside of unit tests,
+# used by the integration test suite.
+fault-injection = []
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+crossbeam-channel = "0.5"
+crossterm = "0.29"
+fuser = "0.18"
+globset = "0.4"
+libc = "0.2"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
+ratatui = "0.30"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+thiserror = "2"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+tempfile = "3"
+xcheckfs = { path = ".", features = ["fault-injection"] }
+
+[profile.release]
+debug = 1
+panic = "abort"
