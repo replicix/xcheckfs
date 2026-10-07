@@ -1,5 +1,11 @@
 # xcheckfs
 
+[![CI](https://github.com/replicix/xcheckfs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/replicix/xcheckfs/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/replicix/xcheckfs?sort=semver)](https://github.com/replicix/xcheckfs/releases/latest)
+[![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](Cargo.toml)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#install)
+
 ![xcheckfs — keeping a close eye on both filesystems, even under production load.](docs/images/mascot.png)
 
 xcheckfs (cross-check FS) is a FUSE file system that validates an *experimental* file system

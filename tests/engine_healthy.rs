@@ -132,7 +132,7 @@ fn broad_workload(h: &Harness, xattrs: bool, exotic: bool) {
         h.setxattr("/d/f", "user.a", b"alpha").unwrap();
         h.setxattr("/d/f", "user.b", &pattern(3, 3000)).unwrap();
         assert_eq!(h.getxattr("/d/f", "user.a").unwrap(), b"alpha");
-        assert_eq!(h.listxattr("/d/f").unwrap(), vec!["user.a", "user.b"]);
+        assert_eq!(h.user_xattrs("/d/f").unwrap(), vec!["user.a", "user.b"]);
         h.setxattr("/d/f", "user.a", b"changed").unwrap();
         assert_eq!(h.getxattr("/d/f", "user.nope").unwrap_err(), libc::ENODATA);
         h.removexattr("/d/f", "user.a").unwrap();

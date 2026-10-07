@@ -392,3 +392,51 @@ fn lock_traffic_concurrent_with_io() {
     h.assert_no_mismatches();
     h.assert_trees_equal();
 }
+
+/// A blocking request that would wait for itself through a chain of owners gets EDEADLK, as the kernel answers a
+/// native F_SETLKW (xcheckfs never blocks inside the backends, so it detects the cycle itself).
+#[test]
+fn deadlock_in_one_file_is_detected() {
+    let (h, ino, _fh) = setup(CheckLevel::Basic, MismatchMode::Log);
+    assert_eq!(h.setlk(ino, A, W, 0, 10), Ok(()));
+    assert_eq!(h.setlk(ino, B, W, 20, 10), Ok(()));
+    let ra = h.setlkw(ino, A, W, 20, 10); // A waits for B
+    nothing_yet(&ra);
+    let rb = h.setlkw(ino, B, W, 0, 10); // B would wait for A: a cycle
+    assert_eq!(rb.recv_timeout(Duration::from_secs(5)).unwrap(), Err(libc::EDEADLK));
+    // B gives up its range: A's wait ends
+    assert_eq!(h.setlk(ino, B, U, 20, 10), Ok(()));
+    granted(&ra);
+    h.assert_no_mismatches();
+}
+
+#[test]
+fn deadlock_across_two_files_is_detected() {
+    let (h, f, _fh) = setup(CheckLevel::Basic, MismatchMode::Log);
+    let g = h.write_file("/lg", &pattern(2, 4096)).id;
+    let _gh = h.open("/lg", libc::O_RDWR);
+    assert_eq!(h.setlk(f, A, W, 0, 0), Ok(()));
+    assert_eq!(h.setlk(g, B, W, 0, 0), Ok(()));
+    let ra = h.setlkw(g, A, W, 0, 0);
+    nothing_yet(&ra);
+    let rb = h.setlkw(f, B, R, 0, 1);
+    assert_eq!(rb.recv_timeout(Duration::from_secs(5)).unwrap(), Err(libc::EDEADLK));
+    assert_eq!(h.setlk(g, B, U, 0, 0), Ok(()));
+    granted(&ra);
+}
+
+/// Waiting without a cycle is not a deadlock, also when the holder itself waits elsewhere.
+#[test]
+fn chains_without_a_cycle_wait() {
+    let (h, ino, _fh) = setup(CheckLevel::Basic, MismatchMode::Log);
+    assert_eq!(h.setlk(ino, A, W, 0, 10), Ok(()));
+    assert_eq!(h.setlk(ino, B, W, 20, 10), Ok(()));
+    let rb = h.setlkw(ino, B, W, 0, 10); // B waits for A
+    let rc = h.setlkw(ino, C, W, 20, 10); // C waits for B (which waits for A): no cycle
+    nothing_yet(&rb);
+    nothing_yet(&rc);
+    assert_eq!(h.setlk(ino, A, U, 0, 10), Ok(()));
+    granted(&rb);
+    assert_eq!(h.setlk(ino, B, U, 0, 0), Ok(()));
+    granted(&rc);
+}

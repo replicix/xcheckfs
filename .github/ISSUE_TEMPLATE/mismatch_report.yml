@@ -1,0 +1,75 @@
+name: Mismatch report
+description: xcheckfs reported a disagreement between the primary and the secondary file system.
+labels: [mismatch]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for a disagreement that xcheckfs **found**. Many of these are bugs in the experimental file
+        system and belong in *its* tracker; we will help narrow it down and tell you if it should move.
+        If you think xcheckfs itself is wrong (false positive, crash), use the *Bug report* form instead.
+  - type: input
+    id: version
+    attributes:
+      label: xcheckfs version
+      description: Output of `xcheckfs --version`.
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel
+      description: Output of `uname -r`.
+    validations:
+      required: true
+  - type: textarea
+    id: filesystems
+    attributes:
+      label: Primary and secondary file systems
+      description: Type, version and mount options of each (`findmnt -o TARGET,FSTYPE,OPTIONS`). Say whether the secondary is the same kind of file system as the primary.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: xcheckfs command line
+      description: The full `xcheckfs mount ...` command, including `--check` level, `--on-mismatch` mode and any rules file.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: mismatch
+    attributes:
+      label: Mismatch JSON
+      description: Output of `xcheckfs ctl MNT mismatches N` for the mismatch (at least `kind`, `field`, the operation, and both values).
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt
+      description: The log lines around the mismatch.
+      render: text
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: The application or command sequence that triggered it, and whether it reproduces every time.
+  - type: dropdown
+    id: verify
+    attributes:
+      label: Does `xcheckfs verify PRIMARY SECONDARY` confirm the difference?
+      description: Run it with the mount stopped (or on a quiesced pair of trees).
+      options:
+        - Yes, verify reports the same difference
+        - No, verify finds the trees identical
+        - Not tried
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Whether the difference is also reproducible without xcheckfs by running the same operations directly on both file systems.

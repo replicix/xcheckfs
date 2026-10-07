@@ -14,3 +14,6 @@ Meta: [Documentation guide](documentation-guide/) — where new docs go and
 templates to use.
 
 Plans: [plans/](plans/) — sequenced implementation plans (none yet).
+
+Contributing: see [CONTRIBUTING.md](../CONTRIBUTING.md) for build, test and
+commit conventions.

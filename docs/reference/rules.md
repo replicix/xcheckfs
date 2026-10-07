@@ -76,6 +76,9 @@ The rule is active immediately and appended to the rules file with a
 
 ## Examples
 
+Rules for measured differences between common file systems (ext4 xattr space,
+tmpfs `fallocate`): [Known differences between file systems](fs-differences.md).
+
 A secondary without extended attribute support: every xattr operation fails
 with `EOPNOTSUPP` there while the primary succeeds.
 

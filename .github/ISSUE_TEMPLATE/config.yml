@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or discussion
+    url: https://github.com/replicix/xcheckfs/discussions
+    about: Ask how to use xcheckfs or discuss ideas before filing an issue.
+  - name: Security vulnerability
+    url: https://github.com/replicix/xcheckfs/security/policy
+    about: Report vulnerabilities privately; see the security policy.

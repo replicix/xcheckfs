@@ -32,3 +32,41 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  # Heavy load through a real mount of two healthy directories: two healthy
+  # file systems must never mismatch, and the data must survive end to end
+  # (fio verification, stress-ng, `xcheckfs verify`). A separate job, so it
+  # runs in parallel with the tests. The release workflow runs it too.
+  stress:
+    name: Stress
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install FUSE, fio and stress-ng
+        run: sudo apt-get update && sudo apt-get install -y fuse3 fio stress-ng
+
+      - name: Build
+        run: cargo build --locked
+
+      # /sys/fs/fuse/connections lets the script abort a hung connection.
+      - name: Mount the FUSE control file system
+        run: sudo mount -t fusectl none /sys/fs/fuse/connections || true
+
+      - name: Stress
+        env:
+          XCHECKFS: ${{ github.workspace }}/target/debug/xcheckfs
+          STRESS_SIZE: 16M
+          STRESS_TIMEOUT: "5"
+          KEEP: failed
+        run: tests/external/run-stress.sh
+
+      - name: Log of the failed run
+        if: failure()
+        run: cat "${TMPDIR:-/tmp}"/xcheckfs-stress.*/xcheckfs.log || true

@@ -479,7 +479,7 @@ fn xattrs_through_the_mount() {
             raw_setxattr(&m.p(p), "user.big", &data(2, 4000)).unwrap();
             assert_eq!(raw_getxattr(&m.p(p), "user.a").unwrap(), b"alpha");
             assert_eq!(raw_getxattr(&m.p(p), "user.big").unwrap(), data(2, 4000));
-            assert_eq!(raw_listxattr(&m.p(p)).unwrap(), vec!["user.a", "user.big"]);
+            assert_eq!(raw_user_xattrs(&m.p(p)).unwrap(), vec!["user.a", "user.big"]);
             raw_setxattr(&m.p(p), "user.a", b"replaced").unwrap();
             assert_eq!(raw_getxattr(&m.p(p), "user.a").unwrap(), b"replaced");
             assert_eq!(raw_getxattr(&m.p(p), "user.none").unwrap_err().raw_os_error(), Some(libc::ENODATA));
@@ -505,7 +505,7 @@ fn xattrs_through_the_mount() {
         fs::hard_link(m.p("f"), m.p("hl")).unwrap();
         assert_eq!(raw_getxattr(&m.p("hl"), "user.big").unwrap(), data(2, 4000));
         fs::rename(m.p("f"), m.p("f2")).unwrap();
-        assert_eq!(raw_listxattr(&m.p("f2")).unwrap(), vec!["user.big"]);
+        assert_eq!(raw_user_xattrs(&m.p("f2")).unwrap(), vec!["user.big"]);
         m.finish();
     }
 }
@@ -580,6 +580,7 @@ fn fallocate_copy_file_range_and_sparse_files() {
 /// functions on buffers prepared before the fork.
 #[test]
 fn mmap_write_and_msync() {
+    let _fork = fork_guard();
     for level in LEVELS {
         let m = mnt!(level, MismatchMode::Log);
         let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(m.p("mapped")).unwrap();
@@ -642,6 +643,15 @@ fn mmap_write_and_msync() {
 
 // --------------------------------------------------------------------------------------------------- locks
 
+/// The FUSE server runs inside the test process: a child forked by one test inherits the descriptors xcheckfs
+/// holds for every other test (lock owners included), so closing them no longer releases their locks until the
+/// child exits. Tests that fork and tests that depend on lock release on close are serialized by this guard. (A
+/// real `xcheckfs mount` never forks while serving.)
+fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn flock_of(typ: i32, start: i64, len: i64) -> libc::flock {
     // SAFETY: flock is plain data.
     let mut fl: libc::flock = unsafe { std::mem::zeroed() };
@@ -659,6 +669,7 @@ fn fcntl_lock(fd: i32, cmd: i32, fl: &mut libc::flock) -> i32 {
 
 #[test]
 fn ofd_locks_between_two_descriptors() {
+    let _fork = fork_guard();
     let m = mnt!(CheckLevel::Thorough, MismatchMode::Log);
     fs::write(m.p("lockfile"), vec![0u8; 4096]).unwrap();
     let f1 = OpenOptions::new().read(true).write(true).open(m.p("lockfile")).unwrap();
@@ -708,6 +719,7 @@ fn ofd_locks_between_two_descriptors() {
 /// happens right after, when the asynchronous RELEASE arrives).
 #[test]
 fn ofd_lock_is_released_when_the_description_is_closed() {
+    let _fork = fork_guard();
     let m = mnt!(CheckLevel::Basic, MismatchMode::Log);
     fs::write(m.p("lockfile"), vec![0u8; 4096]).unwrap();
     let f1 = OpenOptions::new().read(true).write(true).open(m.p("lockfile")).unwrap();
@@ -737,6 +749,7 @@ fn ofd_lock_is_released_when_the_description_is_closed() {
 /// Classic POSIX (per-process) record locks need two processes: fork, with only async-signal-safe calls in the child.
 #[test]
 fn posix_locks_between_two_processes() {
+    let _fork = fork_guard();
     let m = mnt!(CheckLevel::Basic, MismatchMode::Log);
     fs::write(m.p("lockfile"), vec![0u8; 4096]).unwrap();
     let f = OpenOptions::new().read(true).write(true).open(m.p("lockfile")).unwrap();
@@ -1178,27 +1191,47 @@ fn resync_repairs_a_diverged_secondary_through_the_mount() {
     assert_eq!(fs::read(m.h.s_path("dir/file")).unwrap(), content);
     assert_eq!(fs::metadata(m.h.s_path("dir/a")).unwrap().ino(), fs::metadata(m.h.s_path("dir/b")).unwrap().ino());
 
-    // comparisons resume: damage the secondary again behind the mount's back; the next read notices and repairs
-    let (mism, resyncs) = (st.mismatches.load(Ordering::Relaxed), st.resyncs.load(Ordering::Relaxed));
+    // comparisons resume: damage the secondary again behind the mount's back. Which operation notices first is up
+    // to the kernel's caches: a getattr (the secondary's mtime changed; a new mismatch) or the read (a repeat of the
+    // earlier data mismatch). O_DIRECT makes sure the read reaches xcheckfs instead of the page cache.
+    let seen = |st: &xcheckfs::stats::Stats| st.mismatches.load(Ordering::Relaxed) + st.repeats.load(Ordering::Relaxed);
+    let (detections, resyncs) = (seen(st), st.resyncs.load(Ordering::Relaxed));
     let mut bad = data(120, 300_000);
     bad[1000] ^= 0xff;
     let f = OpenOptions::new().write(true).open(m.h.s_path("dir/file")).unwrap();
     f.write_all_at(&bad[1000..1001], 1000).unwrap();
     drop(f);
-    assert_eq!(fs::read(m.p("dir/file")).unwrap(), content);
-    assert!(st.repeats.load(Ordering::Relaxed) >= 1, "the same problem again is counted as a repeat");
-    assert_eq!(st.mismatches.load(Ordering::Relaxed), mism);
-    assert!(st.resyncs.load(Ordering::Relaxed) > resyncs);
+    {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut got = Vec::new();
+        OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(m.p("dir/file")).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, content, "the application gets the primary's data");
+    }
+    assert!(seen(st) > detections, "the damage was noticed");
+    assert!(
+        st.resyncs.load(Ordering::Relaxed) > resyncs,
+        "and repaired again (resyncs {} -> {}, giveups {}, failures {})",
+        resyncs,
+        st.resyncs.load(Ordering::Relaxed),
+        st.resync_giveups.load(Ordering::Relaxed),
+        st.resync_failures.load(Ordering::Relaxed),
+    );
     m.h.assert_trees_equal();
 
     // ... and without damage nothing is reported or repaired any more; normal work is mirrored
-    let (rep, res) = (st.repeats.load(Ordering::Relaxed), st.resyncs.load(Ordering::Relaxed));
+    let (rep, res, mism) =
+        (st.repeats.load(Ordering::Relaxed), st.resyncs.load(Ordering::Relaxed), st.mismatches.load(Ordering::Relaxed));
     read_everything(&m.mnt);
     fs::write(m.p("dir/new"), b"new file").unwrap();
     fs::rename(m.p("dir/new"), m.p("dir/sub/moved")).unwrap();
     assert_eq!(fs::read(m.p("dir/sub/moved")).unwrap(), b"new file");
-    assert_eq!((st.repeats.load(Ordering::Relaxed), st.resyncs.load(Ordering::Relaxed)), (rep, res));
-    assert_eq!(st.mismatches.load(Ordering::Relaxed), mism);
+    assert_eq!(
+        (st.repeats.load(Ordering::Relaxed), st.resyncs.load(Ordering::Relaxed), st.mismatches.load(Ordering::Relaxed)),
+        (rep, res, mism),
+        "quiet phase; new mismatches: {:?}",
+        m.h.policy.history().iter().skip(mism as usize).map(|x| x.summary()).collect::<Vec<_>>()
+    );
     m.h.assert_trees_equal();
 }
 

@@ -11,8 +11,14 @@ use serde::Serialize;
 
 macro_rules! op_kinds {
     ($($v:ident => $n:literal),* $(,)?) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
         pub enum OpKind { $($v),* }
+        /// Serialized as the lowercase name, as used in rules and logs.
+        impl Serialize for OpKind {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.name())
+            }
+        }
         impl OpKind {
             pub const ALL: &'static [OpKind] = &[$(OpKind::$v),*];
             pub fn name(&self) -> &'static str { match self { $(OpKind::$v => $n),* } }

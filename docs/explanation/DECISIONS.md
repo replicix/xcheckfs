@@ -96,9 +96,12 @@ lockstep lock ([DESIGN.md](DESIGN.md#lock-mirroring)). Forwarding classic
 applications, so owners would merge. Letting the kernel handle locks locally
 (`--no-lock-mirroring`) stays available for secondaries without lock
 support.
-**Consequence accepted**: no `EDEADLK` detection, the pid of a conflicting
-lock is reported as 0, and `FUSE_INTERRUPT` is not handled
-([Limitations](../reference/limitations.md)).
+**Consequence**: since xcheckfs never blocks inside a backend, it keeps
+the wait-for graph itself (a shadow of granted ranges per owner and of
+blocked requests) to answer `EDEADLK` like the kernel, and it ends a blocked
+request whose thread has a pending signal with `EINTR` (the FUSE library
+drops `FUSE_INTERRUPT`, so `/proc/<tid>/status` is checked). The pid of a
+conflicting lock is reported as 0 ([Limitations](../reference/limitations.md)).
 
 ## ADR-9: flock(2) stays kernel-local; ioctl is not mirrored
 

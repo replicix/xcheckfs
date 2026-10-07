@@ -247,6 +247,8 @@ pub struct Engine {
     slack: Slack,
     repairs: resync::Repairs,
     quarantine_seq: AtomicU64,
+    /// Shadow of granted record locks and blocked requests (deadlock detection).
+    pub(crate) lock_graph: Mutex<locks::WaitGraph>,
 }
 
 impl Engine {
@@ -278,7 +280,14 @@ impl Engine {
             None
         };
         let use_creds = cfg.creds && sys::is_root();
-        let attr_rules = AttrRules { time_tolerance: cfg.time_tolerance, dir_nlink: cfg.dir_nlink, mtime: true };
+        // btrfs always reports a link count of 1 for directories: comparing
+        // directory link counts against it only produces noise.
+        let btrfs = [&pfd, &sfd].iter().any(|fd| sys::fs_magic(std::os::fd::AsFd::as_fd(*fd)) == Some(sys::BTRFS_MAGIC));
+        if btrfs && cfg.dir_nlink {
+            tracing::info!("a btrfs side reports directory link counts as 1: not comparing them");
+        }
+        let attr_rules =
+            AttrRules { time_tolerance: cfg.time_tolerance, dir_nlink: cfg.dir_nlink && !btrfs, mtime: true };
         let root = Node::new(
             ROOT_ID,
             FileKind::Dir,
@@ -316,6 +325,7 @@ impl Engine {
             slack: Slack::default(),
             repairs: resync::Repairs::default(),
             quarantine_seq: AtomicU64::new(0),
+            lock_graph: Mutex::new(locks::WaitGraph::default()),
         };
         e.stats.nodes.store(1, Relaxed);
         // Compare the roots once; differences are reported like any other.
@@ -514,6 +524,59 @@ impl Engine {
         (p.0, s)
     }
 
+    /// Runs the secondary half alone, after the primary's (for operations
+    /// whose secondary half depends on the primary's result).
+    pub(crate) fn secondary_only<U>(&self, cx: &mut Cx, f: impl FnOnce(&dyn Backend) -> SysResult<U>) -> SysResult<U> {
+        let t0 = Instant::now();
+        let r = f(&*self.b[1]);
+        let ns = t0.elapsed().as_nanos() as u64;
+        cx.sns += ns;
+        cx.window_ns = cx.window_ns.max(ns + cx.pns);
+        self.stats.op(cx.op).secondary.record(ns);
+        cx.sec_errno = Some(r.as_ref().err().copied().unwrap_or(0));
+        r
+    }
+
+    /// The ranges of a file pair that hold data on either side (the union
+    /// of both sides' `SEEK_DATA`/`SEEK_HOLE` extents, up to `size`).
+    /// Holes on both sides read as zeros on both, so only these ranges need
+    /// comparing or copying: a terabyte-sized sparse file costs what its data
+    /// costs. Without `SEEK_DATA` support the whole range is returned.
+    pub(crate) fn data_ranges(&self, pf: std::os::fd::BorrowedFd<'_>, sf: std::os::fd::BorrowedFd<'_>, size: u64) -> Vec<(u64, u64)> {
+        let extents = |be: &dyn Backend, fd: std::os::fd::BorrowedFd<'_>| -> Vec<(u64, u64)> {
+            let mut v = Vec::new();
+            let mut off = 0u64;
+            while off < size {
+                let d = match be.lseek(fd, off as i64, libc::SEEK_DATA) {
+                    Ok(d) => d as u64,
+                    Err(libc::ENXIO) => break,
+                    Err(_) => return vec![(0, size)],
+                };
+                if d >= size {
+                    break;
+                }
+                let h = be.lseek(fd, d as i64, libc::SEEK_HOLE).map(|h| h as u64).unwrap_or(size).min(size);
+                if h <= d || v.len() >= 1 << 16 {
+                    return vec![(0, size)];
+                }
+                v.push((d, h));
+                off = h;
+            }
+            v
+        };
+        let mut all = extents(&*self.b[0], pf);
+        all.extend(extents(&*self.b[1], sf));
+        all.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(all.len());
+        for (a, b) in all {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        merged
+    }
+
     // ------------------------------------------------------------ reporting
 
     pub(crate) fn cx(&self, op: OpKind) -> Cx {
@@ -593,6 +656,16 @@ impl Engine {
             }
         };
         let resyncable = req.is_some();
+        if !resyncable {
+            tracing::debug!(
+                "mismatch on node {} is not repairable (detached {}, has_sec {}, op {:?}, kind {:?})",
+                node.id,
+                self.detached(),
+                node.has_sec(),
+                cx.op,
+                kind
+            );
+        }
         let path = match name {
             Some(n) => self.child_path(node, n),
             None => self.path_of(node),

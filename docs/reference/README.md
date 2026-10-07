@@ -13,3 +13,4 @@ Technical descriptions of how specific parts of xcheckfs work.
 
 - [Checks](checks.md) — what is compared per operation at each check level, mismatch kinds, and what is never compared
 - [Limitations](limitations.md) — everything xcheckfs cannot do, and what to do about it
+- [Known differences between file systems](fs-differences.md) — measured ext4 / xfs / btrfs / tmpfs differences, what is handled automatically, allow rules for the rest

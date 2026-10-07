@@ -40,7 +40,7 @@ only a warning is logged: both agree, and the primary is trusted.
 | `write` | result; bytes written | the written range read back equals the written data (honors `O_APPEND`) | |
 | `release` | | | if the file was written: complete content comparison |
 | `fallocate` | result | attributes afterwards; for punch-hole and zero-range: the range reads as zeros (at most 16 MiB checked) | |
-| `copy_file_range` | result; bytes copied | the copied range read back is equal (at most 16 MiB checked) | |
+| `copy_file_range` | result; bytes copied (the secondary is driven to the primary's count: short copies are legal) | the copied range read back is equal (at most 16 MiB checked) | |
 | `lseek` | result; offset (not for `SEEK_DATA`/`SEEK_HOLE`) | | |
 | `opendir` | result | | |
 | `readdir` | result; the listing at offset 0, as a set of (name, type) | | |
@@ -58,6 +58,12 @@ parent listing is compared after `create`, `mkdir`, `mknod`, `symlink`,
 `link`, `unlink`, `rmdir` and `rename`; "written" means any `write`,
 `fallocate` or `copy_file_range` on the open file.
 
+The whole-file comparison at close (paranoid) and the content repairs and
+their verification (resync) only visit the ranges that hold data on either
+side (`SEEK_DATA`/`SEEK_HOLE`), so a huge sparse file costs what its data
+costs; holes on both sides read as zeros on both. The close-time comparison
+stops after 4 GiB of data per file.
+
 ## Attributes
 
 Compared (same type required; on a type difference nothing else is compared):
@@ -68,7 +74,7 @@ Compared (same type required; on a type difference nothing else is compared):
 | `mode` | permission bits including setuid, setgid, sticky (`07777`) |
 | `uid`, `gid` | |
 | `size` | not for directories |
-| `nlink` | for directories only unless `--no-dir-nlink` |
+| `nlink` | also for directories, unless `--no-dir-nlink` or either side is btrfs ([differences](fs-differences.md)) |
 | `rdev` | device nodes only |
 | `mtime` | within `--time-tolerance` (default 1 s) plus the object's slack, see below; directories too |
 | `ctime` | as a *change*, see below |

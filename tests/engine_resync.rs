@@ -325,7 +325,7 @@ fn object_xattr_differences_are_repaired() {
             raw_setxattr(&r.join("f"), "user.a", b"1").unwrap();
         },
         |s| raw_setxattr(&s.join("f"), "user.extra", b"zzz").unwrap(),
-        |h| assert_eq!(h.listxattr("/f").unwrap(), vec!["user.a".to_string()]),
+        |h| assert_eq!(h.user_xattrs("/f").unwrap(), vec!["user.a".to_string()]),
         K::Xattr,
         Some("list"),
     );
@@ -347,7 +347,7 @@ fn object_xattr_differences_are_repaired() {
         K::Result,
         None,
     );
-    assert_eq!(raw_listxattr(&h.s_path("/f")).unwrap(), vec!["user.a", "user.b"]);
+    assert_eq!(raw_user_xattrs(&h.s_path("/f")).unwrap(), vec!["user.a", "user.b"]);
     // xattrs of a directory and of a symlink are repaired as well (the latter: lookup-visible only through list)
     case(
         |r| {

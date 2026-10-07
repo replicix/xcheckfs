@@ -17,6 +17,7 @@ secondary proves the first.
 | `cargo test --test fuse_mount` | Real in-process mounts driven through the kernel: all operation types, forked processes for POSIX locks, mmap, stress, faults through the mount | `/dev/fuse` and `fusermount3`; skips otherwise |
 | `tests/external/run-libfuse-syscalls.sh` | libfuse `test_syscalls` through the `xcheckfs` binary | a libfuse checkout, opt-in |
 | `tests/external/run-pjdfstest.sh` | pjdfstest through the `xcheckfs` binary | root, network, opt-in |
+| `tests/external/run-stress.sh` | Stress lane: fio with end-to-end verification and stress-ng filesystem stressors through the `xcheckfs` binary over two healthy directories; zero mismatches and a clean `xcheckfs verify` required. Runs in CI as the `stress` job | `/dev/fuse`, `fusermount3`, `fio`, `stress-ng` |
 
 `cargo test` runs everything except the external scripts in about 15 s.
 `XCHECKFS_SOAK=N` makes the stress tests run N times longer. FUSE tests have

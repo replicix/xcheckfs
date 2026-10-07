@@ -475,7 +475,11 @@ impl Engine {
                 let wrong_target = ps.kind() == FileKind::Symlink
                     && ss.kind() == FileKind::Symlink
                     && self.readlink_at(self.p(), pdir, name) != self.readlink_at(self.s(), sdir, name);
-                if ps.kind() != ss.kind() || wrong_identity || wrong_target {
+                // The primary's object has this one name, the secondary's has others: it is not this object
+                // (RENAME_EXCHANGE of hard-linked files that failed on the secondary, for example). Repairing it
+                // in place would overwrite the content of those other names.
+                let shared = ps.kind() != FileKind::Dir && ps.nlink == 1 && ss.nlink > 1;
+                if ps.kind() != ss.kind() || wrong_identity || shared || wrong_target {
                     self.quarantine_at(sdir, name, path, why);
                     self.remove_tree(sdir, name)?;
                     self.copy_tree(pdir, sdir, name, cc)
@@ -655,30 +659,80 @@ impl Engine {
     fn copy_content(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>, size: u64) -> Result<(), String> {
         let (p, s) = (self.p(), self.s());
         let pf = p.open(pfd, libc::O_RDONLY).map_err(|x| e("open primary", x))?;
-        let sf = s.open(sfd, libc::O_RDWR).map_err(|x| e("open secondary", x))?;
+        // A read-only file (mode 0444, say) cannot be opened for writing by its owner without CAP_DAC_OVERRIDE:
+        // give it the owner's write permission for the time of the repair (`copy_attrs` sets the mode afterwards,
+        // also on the error path below).
+        let mut restore = None;
+        let sf = match s.open(sfd, libc::O_RDWR) {
+            Err(libc::EACCES) => {
+                if let Ok(st) = s.stat(sfd)
+                    && s.chmod(sfd, FileKind::Regular, st.perm() | 0o200).is_ok()
+                {
+                    restore = Some(st.perm());
+                }
+                s.open(sfd, libc::O_RDWR)
+            }
+            r => r,
+        };
+        let sf = match sf {
+            Ok(f) => f,
+            Err(x) => {
+                if let Some(m) = restore {
+                    let _ = s.chmod(sfd, FileKind::Regular, m);
+                }
+                return Err(e("open secondary", x));
+            }
+        };
+        let res = self.copy_content_to(p, pf.as_fd(), s, sf.as_fd(), sfd, size);
+        if let Some(m) = restore {
+            let _ = s.chmod(sfd, FileKind::Regular, m);
+        }
+        res
+    }
+
+    fn copy_content_to(
+        &self,
+        p: &dyn Backend,
+        pf: BorrowedFd<'_>,
+        s: &dyn Backend,
+        sf: BorrowedFd<'_>,
+        sfd: BorrowedFd<'_>,
+        size: u64,
+    ) -> Result<(), String> {
+        // Only ranges holding data on either side need looking at (sparse
+        // files); everything else is a hole on both sides.
+        let ssize = s.stat(sf).map(|st| st.size).unwrap_or(0);
+        let ranges = self.data_ranges(pf, sf, size.max(ssize));
         let mut a = self.bufs.get(CHUNK);
         let mut b = self.bufs.get(CHUNK);
-        let mut off = 0u64;
-        let res = loop {
-            let k = match p.pread(pf.as_fd(), &mut a, off) {
-                Ok(k) => k,
-                Err(x) => break Err(e("read primary", x)),
-            };
-            if k == 0 {
-                break Ok(());
-            }
-            let same = matches!(s.pread(sf.as_fd(), &mut b[..k], off), Ok(j) if j == k && a[..k] == b[..k]);
-            if !same
-                && let Err(x) = write_all(s, sf.as_fd(), &a[..k], off) {
-                    break Err(x);
+        let mut res = Ok(());
+        'ranges: for (start, end) in ranges {
+            let mut off = start;
+            while off < end {
+                let want = ((end - off) as usize).min(CHUNK);
+                let k = match p.pread(pf, &mut a[..want], off) {
+                    Ok(k) => k,
+                    Err(x) => {
+                        res = Err(e("read primary", x));
+                        break 'ranges;
+                    }
+                };
+                if k == 0 {
+                    break; // beyond the primary's end: truncated below
                 }
-            off += k as u64;
-        };
+                let same = matches!(s.pread(sf, &mut b[..k], off), Ok(j) if j == k && a[..k] == b[..k]);
+                if !same && let Err(x) = write_all(s, sf, &a[..k], off) {
+                    res = Err(x);
+                    break 'ranges;
+                }
+                off += k as u64;
+            }
+        }
         self.bufs.put(a);
         self.bufs.put(b);
         res?;
-        s.truncate(sfd, Some(sf.as_fd()), size).map_err(|x| e("truncate", x))?;
-        s.fsync(sf.as_fd(), false).map_err(|x| e("fsync", x))
+        s.truncate(sfd, Some(sf), size).map_err(|x| e("truncate", x))?;
+        s.fsync(sf, false).map_err(|x| e("fsync", x))
     }
 
     /// xattrs, owner, mode and times. Failures surface in verification.
@@ -779,21 +833,34 @@ impl Engine {
     fn compare_files(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>) -> Result<(), String> {
         let pf = self.p().open(pfd, libc::O_RDONLY).map_err(|x| e("open primary", x))?;
         let sf = self.s().open(sfd, libc::O_RDONLY).map_err(|x| e("open secondary", x))?;
+        let (ps, ss) = (self.p().stat(pf.as_fd()), self.s().stat(sf.as_fd()));
+        let (Ok(ps), Ok(ss)) = (ps, ss) else { return Err("stat error while verifying".into()) };
+        if ps.size != ss.size {
+            return Err(format!("size still differs: {} vs {}", ps.size, ss.size));
+        }
         let mut a = self.bufs.get(CHUNK);
         let mut b = self.bufs.get(CHUNK);
-        let mut off = 0u64;
-        let res = loop {
-            let (Ok(k), Ok(j)) = (self.p().pread(pf.as_fd(), &mut a, off), self.s().pread(sf.as_fd(), &mut b, off)) else {
-                break Err("read error while verifying".to_string());
-            };
-            if let Some(d) = compare::diff_data(off, &a[..k], &b[..j]) {
-                break Err(format!("content still differs: {d}"));
+        let mut res = Ok(());
+        'ranges: for (start, end) in self.data_ranges(pf.as_fd(), sf.as_fd(), ps.size) {
+            let mut off = start;
+            while off < end {
+                let want = ((end - off) as usize).min(CHUNK);
+                let (Ok(k), Ok(j)) =
+                    (self.p().pread(pf.as_fd(), &mut a[..want], off), self.s().pread(sf.as_fd(), &mut b[..want], off))
+                else {
+                    res = Err("read error while verifying".to_string());
+                    break 'ranges;
+                };
+                if let Some(d) = compare::diff_data(off, &a[..k], &b[..j]) {
+                    res = Err(format!("content still differs: {d}"));
+                    break 'ranges;
+                }
+                if k == 0 {
+                    break;
+                }
+                off += k as u64;
             }
-            if k == 0 {
-                break Ok(());
-            }
-            off += k as u64;
-        };
+        }
         self.bufs.put(a);
         self.bufs.put(b);
         res

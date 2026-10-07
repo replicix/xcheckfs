@@ -230,6 +230,8 @@ impl Engine {
             let d = be.opendir(dir.fd(side).as_fd())?;
             be.readdir(d.as_fd())
         });
+        // (a listing that can be read on one side only is a difference, too)
+        self.cmp_result(cx, dir, None, &p, &s, false)?;
         if let (Ok(p), Some(Ok(s))) = (&p, &s) {
             self.cmp_dir(cx, dir, p, s, what)?;
         }
@@ -243,29 +245,52 @@ impl Engine {
         }
         self.stats.verifications.fetch_add(1, Relaxed);
         let (p, s) = self.both(cx, true, None, |side, be| be.open(n.fd(side).as_fd(), libc::O_RDONLY));
+        // (a file that can be read on one side only is a difference, too)
+        self.cmp_result(cx, n, None, &p, &s, excl)?;
         let (Ok(pf), Some(Ok(sf))) = (p, s) else { return Ok(()) };
-        const CHUNK: usize = 1 << 20;
-        let mut off = 0u64;
-        loop {
-            let (a, b) = self.both(cx, true, None, |side, be| {
-                let fd = if side == Side::Primary { pf.as_fd() } else { sf.as_fd() };
-                let mut buf = self.bufs.get(CHUNK);
-                let k = be.pread(fd, &mut buf, off)?;
-                buf.truncate(k);
-                Ok(buf)
-            });
-            let (Ok(a), Some(Ok(b))) = (a, b) else { return Ok(()) };
-            if let Some(d) = compare::diff_data(off, &a, &b) {
-                return self.report(cx, n, MismatchKind::Content, None, format!("{} bytes read", a.len()), format!("{} bytes read", b.len()), d, excl);
-            }
-            let done = a.len() < CHUNK;
-            off += a.len() as u64;
-            self.bufs.put(a);
-            self.bufs.put(b);
-            if done {
-                return Ok(());
+        // Only the ranges with data on either side (sparse files), and at most
+        // PARANOID_CAP bytes of them: the check runs at close, holding the
+        // file's lock.
+        const CHUNK: u64 = 1 << 20;
+        const PARANOID_CAP: u64 = 4 << 30;
+        let (ps, ss) = self.both(cx, true, None, |side, be| be.stat(if side == Side::Primary { pf.as_fd() } else { sf.as_fd() }));
+        self.cmp_result(cx, n, None, &ps, &ss, excl)?;
+        let size = match (ps, ss) {
+            (Ok(a), Some(Ok(b))) => a.size.max(b.size),
+            _ => return Ok(()),
+        };
+        let mut budget = PARANOID_CAP;
+        for (start, end) in self.data_ranges(pf.as_fd(), sf.as_fd(), size) {
+            let mut off = start;
+            while off < end {
+                if budget == 0 {
+                    tracing::debug!("{}: content compared up to {PARANOID_CAP} bytes of data", self.path_of(n));
+                    return Ok(());
+                }
+                let want = (end - off).min(CHUNK).min(budget) as usize;
+                let (a, b) = self.both(cx, true, None, |side, be| {
+                    let fd = if side == Side::Primary { pf.as_fd() } else { sf.as_fd() };
+                    let mut buf = self.bufs.get(want);
+                    let k = be.pread(fd, &mut buf, off)?;
+                    buf.truncate(k);
+                    Ok(buf)
+                });
+                self.cmp_result(cx, n, None, &a, &b, excl)?;
+                let (Ok(a), Some(Ok(b))) = (a, b) else { return Ok(()) };
+                if let Some(d) = compare::diff_data(off, &a, &b) {
+                    return self.report(cx, n, MismatchKind::Content, None, format!("{} bytes read", a.len()), format!("{} bytes read", b.len()), d, excl);
+                }
+                let got = a.len() as u64;
+                self.bufs.put(a);
+                self.bufs.put(b);
+                if got == 0 {
+                    break;
+                }
+                off += got;
+                budget -= got.min(budget);
             }
         }
+        Ok(())
     }
 
     /// Reads `len` bytes at `off` through a readable descriptor of `n`.
@@ -350,6 +375,7 @@ impl Engine {
                 p?;
             }
             let (p, s) = self.both(cx, sec, None, |side, be| be.stat(n.fd(side).as_fd()));
+            self.cmp_result(cx, &n, None, &p, &s, true)?;
             let pst = p?;
             if let Some(Ok(sst)) = &s {
                 self.cmp_stat(cx, &n, &pst, sst, true, "after setattr")?;
@@ -524,6 +550,7 @@ impl Engine {
             if let Some(child) = cands[0].and_then(|st| self.nodes.get(self.map_ino(st.ino)))
                 && self.sec_for(&[&child]) {
                     let (a, b) = self.both(cx, true, None, |side, be| be.stat(child.fd(side).as_fd()));
+                    self.cmp_result(cx, &child, None, &a, &b, true)?;
                     if let (Ok(a), Some(Ok(b))) = (a, b) {
                         self.cmp_stat(cx, &child, &a, &b, true, "after remove")?;
                     }
@@ -612,6 +639,7 @@ impl Engine {
                     if let Some(src) = cands[0].and_then(|st| self.nodes.get(self.map_ino(st.ino)))
                         && self.sec_for(&[&src]) {
                             let (a, b) = self.both(cx, true, None, |side, be| be.stat(src.fd(side).as_fd()));
+                            self.cmp_result(cx, &src, None, &a, &b, true)?;
                             if let (Ok(a), Some(Ok(b))) = (a, b) {
                                 self.cmp_stat(cx, &src, &a, &b, true, "after rename")?;
                             }
@@ -681,7 +709,9 @@ impl Engine {
 
     /// Reads `size` bytes at `off`; `out` receives the primary's data.
     pub fn read(&self, _ctx: &Ctx, ino: u64, fh: u64, off: u64, size: u32, out: &mut dyn FnMut(&[u8])) -> Result<(), i32> {
-        self.run(OpKind::Read, ino, || format!("{} off={off} len={size}", self.detail_ino(ino)), |cx| {
+        // The data is handed out only after `run` returned, i.e. after any
+        // repair the comparison asked for: the reply must not overtake it.
+        let pb = self.run(OpKind::Read, ino, || format!("{} off={off} len={size}", self.detail_ino(ino)), |cx| {
             let f = self.file(fh)?;
             let n = &f.node;
             let _l = self.lock(&[(n.id, false)]);
@@ -721,10 +751,11 @@ impl Engine {
             }
             cx.bytes = pb.len() as u64;
             self.stats.bytes_read.fetch_add(pb.len() as u64, Relaxed);
-            out(&pb);
-            self.bufs.put(pb);
-            Ok(())
-        })
+            Ok(pb)
+        })?;
+        out(&pb);
+        self.bufs.put(pb);
+        Ok(())
     }
 
     pub fn write(&self, _ctx: &Ctx, ino: u64, fh: u64, off: u64, data: &[u8]) -> Result<u32, i32> {
@@ -830,6 +861,7 @@ impl Engine {
             f.written.store(true, Relaxed);
             if self.thorough() && matches!(s, Some(Ok(()))) && n.has_sec() {
                 let (a, b) = self.both(cx, true, None, |side, be| be.stat(n.fd(side).as_fd()));
+                self.cmp_result(cx, n, None, &a, &b, true)?;
                 if let (Ok(a), Some(Ok(b))) = (a, b) {
                     self.cmp_stat(cx, n, &a, &b, true, "after fallocate")?;
                 }
@@ -889,17 +921,50 @@ impl Engine {
             let _l = self.lock(&[(fi.node.id, false), (fo.node.id, true)]);
             let sec = !self.detached() && fi.has_sec() && fo.has_sec();
             let l = len.min(u32::MAX as u64) as usize;
-            let (p, s) = self.both(cx, sec, None, |side, be| be.copy_file_range(fi.fd(side).as_fd(), off_in, fo.fd(side).as_fd(), off_out, l, flags));
+            // copy_file_range may legitimately copy less than asked, and file
+            // systems differ in how much (xfs/btrfs vs ext4/tmpfs). The
+            // application continues from the primary's count, so the
+            // secondary must copy exactly that much: the primary runs first,
+            // then the secondary loops over its own short copies.
+            let (p, _) = self.both(cx, false, None, |side, be| {
+                be.copy_file_range(fi.fd(side).as_fd(), off_in, fo.fd(side).as_fd(), off_out, l, flags)
+            });
+            let s = sec.then(|| {
+                let want = *p.as_ref().unwrap_or(&l);
+                self.secondary_only(cx, |be| {
+                    let mut done = 0;
+                    loop {
+                        let r = be.copy_file_range(
+                            fi.fd(Side::Secondary).as_fd(),
+                            off_in + done as u64,
+                            fo.fd(Side::Secondary).as_fd(),
+                            off_out + done as u64,
+                            want - done,
+                            flags,
+                        );
+                        match r {
+                            Ok(0) => return Ok(done),
+                            Ok(k) => done += k,
+                            Err(e) if done == 0 => return Err(e),
+                            Err(_) => return Ok(done),
+                        }
+                        if done >= want || p.is_err() {
+                            return Ok(done);
+                        }
+                    }
+                })
+            });
             self.cmp_result(cx, &fo.node, None, &p, &s, true)?;
             let pn = p?;
             fo.written.store(true, Relaxed);
             cx.bytes = pn as u64;
             if let Some(Ok(sn)) = s {
                 if sn != pn {
-                    self.report(cx, &fo.node, MismatchKind::Length, None, pn.to_string(), sn.to_string(), String::new(), true)?;
+                    self.report(cx, &fo.node, MismatchKind::Length, None, pn.to_string(), sn.to_string(), "the secondary could not copy as much as the primary".into(), true)?;
                 } else if self.thorough() && fo.node.has_sec() {
                     let k = (pn as u64).min(VERIFY_CAP) as usize;
                     let (a, b) = self.both(cx, true, None, |side, be| self.read_back(be, &fo.node, side, off_out, k));
+                    self.cmp_result(cx, &fo.node, None, &a, &b, true)?;
                     if let (Ok(a), Some(Ok(b))) = (a, b) {
                         self.stats.verifications.fetch_add(1, Relaxed);
                         if let Some(d) = compare::diff_data(off_out, &a, &b) {

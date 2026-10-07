@@ -434,8 +434,23 @@ fn run_mount(
             logging::init_stderr(level, !a.no_color && std::io::stderr().is_terminal())
         }
     }
-    if let Some(p) = &a.pid_file {
-        std::fs::write(p, format!("{}\n", std::process::id())).with_context(|| format!("pid file {}", p.display()))?;
+    // Signals are caught from here on: one arriving while the mount is being
+    // set up is handled (by unmounting) right after it is up, instead of
+    // killing the process and leaving a dead mount behind.
+    let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<Wake>();
+    {
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1};
+        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP, SIGUSR1])?;
+        let (tx, stats) = (wake_tx.clone(), stats.clone());
+        std::thread::Builder::new().name("xcheckfs-signals".into()).spawn(move || {
+            for s in signals.forever() {
+                if s == SIGUSR1 {
+                    tracing::warn!("{}", control::summary(&stats));
+                } else if tx.send(Wake::Signal(s)).is_err() {
+                    return;
+                }
+            }
+        })?;
     }
     if nofile < 65_536 {
         tracing::warn!("RLIMIT_NOFILE is only {nofile}; xcheckfs needs two descriptors per cached inode");
@@ -459,6 +474,7 @@ fn run_mount(
         ..EngineConfig::default()
     };
     let engine = Arc::new(Engine::new(cfg.clone(), Arc::new(pb), Arc::new(sb), policy.clone(), stats.clone(), sink)?);
+    Engine::spawn_lock_watchdog(&engine);
 
     let info = serde_json::json!({
         "mountpoint": mountpoint.display().to_string(),
@@ -489,11 +505,16 @@ fn run_mount(
         a.on_mismatch.name(),
         if mountpoint == primary { " [mounted over the primary: all access goes through xcheckfs]" } else { "" }
     );
+    // Only now: a failed start must not clobber another daemon's pid file.
+    if let Some(p) = &a.pid_file
+        && let Err(e) = std::fs::write(p, format!("{}\n", std::process::id()))
+    {
+        tracing::error!("pid file {}: {e}", p.display());
+    }
     if let Some(n) = notifier.as_mut() {
         n.ready();
     }
 
-    let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<Wake>();
     let ended = Arc::new(AtomicBool::new(false));
     {
         let (tx, ended) = (wake_tx.clone(), ended.clone());
@@ -505,21 +526,6 @@ fn run_mount(
             let _ = tx.send(Wake::Ended);
         })?;
     }
-    {
-        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1};
-        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP, SIGUSR1])?;
-        let (tx, stats) = (wake_tx.clone(), stats.clone());
-        std::thread::Builder::new().name("xcheckfs-signals".into()).spawn(move || {
-            for s in signals.forever() {
-                if s == SIGUSR1 {
-                    tracing::warn!("{}", control::summary(&stats));
-                } else if tx.send(Wake::Signal(s)).is_err() {
-                    return;
-                }
-            }
-        })?;
-    }
-
     let shutdown = Arc::new(AtomicBool::new(false));
     if let Some(rx) = rx {
         {
@@ -592,28 +598,35 @@ fn sink_sender(sink: &EventSink) -> crossbeam_channel::Sender<xcheckfs::events::
 /// Unmounts, falling back to a lazy detach when the mount is busy. (fuser's
 /// own unmount handle cannot be used once the session runs in the
 /// background: the mount moves into the background session.)
+///
+/// The kernel releases closed files asynchronously, so a mount that was busy
+/// a moment ago is retried a few times before detaching lazily.
 fn unmount(mp: &Path) {
+    let Ok(c) = std::ffi::CString::new(mp.as_os_str().as_encoded_bytes()) else { return };
+    let fusermount = |args: &[&str]| {
+        std::process::Command::new("fusermount3")
+            .args(args)
+            .arg(mp)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    // SAFETY: valid C string.
+    let plain = || if sys::is_root() { unsafe { libc::umount2(c.as_ptr(), 0) == 0 } } else { fusermount(&["-u"]) };
+    for attempt in 0..6 {
+        if plain() {
+            return;
+        }
+        if attempt < 5 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    tracing::warn!("unmount failed (busy); detaching lazily");
     if sys::is_root() {
-        let Ok(c) = std::ffi::CString::new(mp.as_os_str().as_encoded_bytes()) else { return };
         // SAFETY: valid C string.
-        if unsafe { libc::umount2(c.as_ptr(), 0) } != 0 {
-            tracing::warn!("unmount failed ({}); detaching lazily", std::io::Error::last_os_error());
-            // SAFETY: valid C string.
-            unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
-        }
+        unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
     } else {
-        let quiet = |args: &[&str]| {
-            std::process::Command::new("fusermount3")
-                .args(args)
-                .arg(mp)
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        };
-        if !quiet(&["-u"]) {
-            tracing::warn!("unmount failed (busy?); detaching lazily");
-            quiet(&["-u", "-z"]);
-        }
+        fusermount(&["-u", "-z"]);
     }
 }
 

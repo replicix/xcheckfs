@@ -145,6 +145,12 @@ impl HarnessBuilder {
     /// Builds the harness after `seed(primary_dir, secondary_dir)` pre-populated the trees (e.g. to make the
     /// secondary start out different).
     pub fn build_with(self, seed: impl FnOnce(&Path, &Path)) -> Harness {
+        // Like the binary: two descriptors per cached inode exceed small
+        // default soft limits (1024) in the bigger workloads.
+        static NOFILE: std::sync::Once = std::sync::Once::new();
+        NOFILE.call_once(|| {
+            xcheckfs::sys::raise_nofile_limit();
+        });
         let ptmp = tmp_in(&self.pbase);
         let stmp = tmp_in(&self.sbase);
         seed(ptmp.path(), stmp.path());
@@ -169,6 +175,7 @@ impl HarnessBuilder {
         let engine = Arc::new(
             Engine::new(cfg, pfault.clone(), fault.clone(), policy.clone(), stats.clone(), sink).unwrap(),
         );
+        Engine::spawn_lock_watchdog(&engine);
         Harness { engine, policy, stats, pfault, fault, ptmp, stmp, ctx: ctx(), mark: AtomicUsize::new(0), events }
     }
 }
@@ -627,6 +634,11 @@ impl Harness {
             XattrOut::Size(n) => Ok(vec![0; n]),
         }
     }
+    /// The `user.*` names only: hosts add their own (e.g. `security.selinux`).
+    pub fn user_xattrs(&self, path: &str) -> Result<Vec<String>, i32> {
+        Ok(self.listxattr(path)?.into_iter().filter(|n| n.starts_with("user.")).collect())
+    }
+
     pub fn listxattr(&self, path: &str) -> Result<Vec<String>, i32> {
         let a = self.try_lookup(path)?;
         match self.engine.listxattr(&self.ctx, a.id, 65536)? {
@@ -755,6 +767,12 @@ pub fn raw_listxattr(path: &Path) -> std::io::Result<Vec<String>> {
         buf.split(|&b| b == 0).filter(|n| !n.is_empty()).map(|n| String::from_utf8_lossy(n).into_owned()).collect();
     v.sort();
     Ok(v)
+}
+
+/// The `user.*` names of [`raw_listxattr`]: hosts add their own (e.g.
+/// `security.selinux` under SELinux).
+pub fn raw_user_xattrs(path: &Path) -> std::io::Result<Vec<String>> {
+    Ok(raw_listxattr(path)?.into_iter().filter(|n| n.starts_with("user.")).collect())
 }
 
 /// Whether `user.*` xattrs work in this directory.

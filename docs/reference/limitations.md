@@ -65,14 +65,19 @@ Unsupported operations are counted in the statistics.
 
 - `fcntl` record locks are mirrored with non-blocking OFD locks and an
   xcheckfs-side queue ([Design](../explanation/DESIGN.md#lock-mirroring)).
-- **`FUSE_INTERRUPT` is not handled.** A process blocked in `F_SETLKW` cannot
-  be interrupted by a non-fatal signal; its wait is cancelled (`EINTR`) when
-  it closes the file or exits.
+- **`FUSE_INTERRUPT` is not handled** by the FUSE library. For blocked
+  `F_SETLKW` requests, the only ones xcheckfs keeps waiting, a watchdog
+  checks the waiting thread for pending signals ten times a second and ends
+  the request with `EINTR`, as the kernel would; other operations finish
+  normally (they never wait indefinitely).
 - OFD locks (`F_OFD_SETLK`) are released when the FUSE `RELEASE` of their
   file description arrives, which the kernel sends asynchronously right
   after `close(2)` returns: a lock attempt racing the close can briefly see
   the old lock.
-- No deadlock detection: `EDEADLK` is never returned.
+- Deadlocks between owners (also across files) are answered `EDEADLK`, like
+  the kernel does for `F_SETLKW`. The kernel does not do this for OFD locks;
+  xcheckfs cannot tell them apart, so a cycle of OFD lock owners gets
+  `EDEADLK` where it would hang natively.
 - `F_GETLK` reports pid 0 for the conflicting lock.
 - **`flock(2)` is kernel-local** and not mirrored
   ([ADR-9](../explanation/DECISIONS.md#adr-9-flock2-stays-kernel-local-ioctl-is-not-mirrored)).

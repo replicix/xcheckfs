@@ -311,14 +311,11 @@ impl Backend for PosixBackend {
     }
 
     fn opendir(&self, node: BorrowedFd<'_>) -> SysResult<OwnedFd> {
-        // SAFETY: valid fd.
-        owned(unsafe {
-            libc::openat(
-                node.as_raw_fd(),
-                c".".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        })
+        // Through the magic link, like `open`: opening "." relative to the descriptor would demand search (x)
+        // permission on the directory, while listing it requires read permission only.
+        let p = proc_path(node);
+        // SAFETY: valid C string.
+        owned(unsafe { libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) })
     }
 
     fn readdir(&self, dir: BorrowedFd<'_>) -> SysResult<Vec<DirEntry>> {

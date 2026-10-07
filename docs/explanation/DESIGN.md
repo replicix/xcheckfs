@@ -172,6 +172,13 @@ both file systems see the same lock tables ([ADR-8](DECISIONS.md#adr-8-lock-mirr
   requests are retried in FIFO order.
 - Closing the file releases the owner's locks on both sides, retries the
   queue, and cancels the owner's own waiters with `EINTR`.
+- Because nothing blocks in the kernel's lock code, xcheckfs does the
+  kernel's two other jobs for blocked requests itself: a request that would
+  wait for itself through a chain of owners (also across files) is answered
+  `EDEADLK`, using a shadow of the granted ranges and of the queued requests;
+  and a request whose thread has a pending signal is ended with `EINTR` (a
+  watchdog reads `/proc/<tid>/status`, since the FUSE library drops
+  `FUSE_INTERRUPT`).
 
 **Why not block inside the backends?** Two reasons. First, when a lock is
 released, the two file systems may wake their waiters in different,

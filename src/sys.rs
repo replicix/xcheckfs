@@ -399,6 +399,34 @@ pub fn dup(fd: BorrowedFd<'_>) -> SysResult<OwnedFd> {
     owned(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) })
 }
 
+pub const BTRFS_MAGIC: i64 = 0x9123_683E;
+
+/// `f_type` of the file system holding `fd` (`statfs(2)`).
+pub fn fs_magic(fd: BorrowedFd<'_>) -> Option<i64> {
+    let mut s = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: valid fd, valid out pointer.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), s.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: initialised by fstatfs.
+    #[allow(clippy::unnecessary_cast)] // f_type's type differs between targets
+    Some(unsafe { s.assume_init() }.f_type as i64)
+}
+
+/// Whether thread `tid` has a signal pending that it does not block
+/// (`SigPnd`/`ShdPnd` and `SigBlk` of `/proc/<tid>/status`). Ignored
+/// signals are discarded by the kernel and never show up as pending.
+pub fn signal_pending(tid: u32) -> bool {
+    let Ok(s) = std::fs::read_to_string(format!("/proc/{tid}/status")) else { return false };
+    let field = |name: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            .unwrap_or(0)
+    };
+    (field("SigPnd:") | field("ShdPnd:")) & !field("SigBlk:") != 0
+}
+
 /// Reads the path an O_PATH descriptor currently refers to.
 pub fn fd_path(fd: BorrowedFd<'_>) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()

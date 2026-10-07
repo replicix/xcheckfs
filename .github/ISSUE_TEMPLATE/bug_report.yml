@@ -1,0 +1,71 @@
+name: Bug report
+description: xcheckfs itself misbehaves (crash, hang, wrong result to applications, false positive).
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when **xcheckfs** is at fault: it crashed or hung, an application got a wrong result
+        from the mount, or it reported a mismatch although both file systems behaved correctly (a false positive).
+        If xcheckfs correctly caught the experimental file system misbehaving, use the *Mismatch report* form.
+        For security problems, do not file an issue; see the security policy.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got.
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of problem
+      options:
+        - Crash or panic
+        - Hang or deadlock
+        - Wrong result delivered to an application
+        - False positive (mismatch reported, both sides correct)
+        - Resync or quarantine misbehaved
+        - TUI, CLI or control socket problem
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: xcheckfs version
+      description: Output of `xcheckfs --version`, and how it was installed (static binary, deb, rpm, source).
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel and distribution
+      description: Output of `uname -r` and the distribution name.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Command line and file systems
+      description: The full `xcheckfs mount ...` command (check level, mismatch mode, rules) and the type and mount options of the primary and secondary file systems.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: mismatch
+    attributes:
+      label: Mismatch JSON (false positives)
+      description: Output of `xcheckfs ctl MNT mismatches N`. Name the `kind` and `field` that fired and explain why both results are acceptable.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and backtrace
+      description: Log excerpt (run with `-vv` if possible), panic message or stack.
+      render: text
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: Smallest sequence of commands or a program that triggers it.

@@ -50,6 +50,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 xcheckfs = { path = ".", features = ["fault-injection"] }
 
 [profile.release]

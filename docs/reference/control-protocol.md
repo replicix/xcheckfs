@@ -93,7 +93,7 @@ letters `c`, `r`, `s`, `e`, `d` are accepted for `continue`, `retry`,
 |---|---|
 | `id` | sequence number, as in `resolve ID` and the `MISMATCH #ID` log line |
 | `time` | Unix time, seconds (float) |
-| `op` | the operation as its Rust variant name (`Lookup`, `Read`, `CopyFileRange`, ...). Rules use lower-case names (`lookup`, `copy_file_range`). |
+| `op` | the operation, lower case (`lookup`, `read`, `copy_file_range`, ...), the same names rules use. |
 | `kind` | [mismatch kind](checks.md#mismatch-kinds), lower case |
 | `ino` | node id |
 | `path` | path relative to the mount root, best effort |

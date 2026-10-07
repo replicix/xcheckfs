@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest an improvement or a new check.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today? For a missing check, describe the experimental file system behavior it would catch (without needing to name the product).
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like xcheckfs to do? CLI flags, check semantics, output.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds, allow rules, or other tools you tried.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: I read the [goals and non-goals](https://github.com/replicix/xcheckfs/blob/main/docs/explanation/GOALS.md) and this fits them.
+          required: true

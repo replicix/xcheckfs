@@ -561,7 +561,7 @@ fn xattr_value_and_list_faults() {
         let h = prepared(level);
         h.setxattr("/f", "user.k", b"value").unwrap();
         h.inject(Fault::new(FaultOp::Listxattr, Effect::XattrListAdd(b"user.phantom".to_vec())));
-        assert_eq!(h.listxattr("/f").unwrap(), vec!["user.k"]);
+        assert_eq!(h.user_xattrs("/f").unwrap(), vec!["user.k"]);
         let m = h.expect_mismatch(K::Xattr, Some("list"));
         assert!(m.secondary.contains("user.phantom"), "{}", m.summary());
 
@@ -731,12 +731,26 @@ fn skipped_copy_file_range() {
             h.expect_mismatch(K::Attr, Some("size"));
         }
     }
-    // short copy
+    // short copies are legal (and file systems differ in how much one call copies): the secondary is driven to
+    // the primary's count, which is not a mismatch
+    for level in [B, T, P] {
+        let h = prepared(level);
+        let (a, b) = (h.open("/f", libc::O_RDONLY), h.create("/g"));
+        h.inject(Fault::new(FaultOp::CopyFileRange, Effect::ShortWrite(100)));
+        assert_eq!(h.engine.copy_file_range(&h.ctx, a.fh, 0, b.fh, 0, 5000, 0).unwrap(), 5000);
+        h.clear_faults();
+        h.getattr("/g");
+        h.assert_no_mismatches();
+        h.assert_trees_equal();
+    }
+    // ... but a secondary that cannot get there is
     let h = prepared(B);
     let (a, b) = (h.open("/f", libc::O_RDONLY), h.create("/g"));
     h.inject(Fault::new(FaultOp::CopyFileRange, Effect::ShortWrite(100)));
+    h.inject(Fault::new(FaultOp::CopyFileRange, Effect::Errno(libc::EIO)).nth(2));
     h.engine.copy_file_range(&h.ctx, a.fh, 0, b.fh, 0, 5000, 0).unwrap();
-    h.expect_mismatch(K::Length, None);
+    let m = h.expect_mismatch(K::Length, None);
+    assert_eq!((m.primary.as_str(), m.secondary.as_str()), ("5000", "100"));
 }
 
 // ------------------------------------------------------------------------------------- lseek / delays
