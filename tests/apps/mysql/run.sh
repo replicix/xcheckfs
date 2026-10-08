@@ -156,7 +156,7 @@ wait_up() {
     return 1
 }
 
-sql() { docker exec -i "$SRV" mysql -uroot -N -B "$@"; }
+sql() { docker exec -i "$SRV" mysql --protocol=tcp -h127.0.0.1 -uroot -N -B "$@"; }
 xcctl() { docker exec "$SRV" /x/xcheckfs ctl --socket "$SOCK" "$@"; }
 
 # compact one-line status (ops, mismatches, ...) of the running mount
@@ -216,8 +216,8 @@ table_report() {
         tl+="sbtest.sbtest$i,"
     done
     {
-        docker exec -i "$c" mysql -uroot -N -B -e "$q" | awk '{print $1" rows="$2}'
-        docker exec -i "$c" mysql -uroot -N -B -e "CHECKSUM TABLE ${tl%,};" | awk '{print $1" checksum="$2}'
+        docker exec -i "$c" mysql --protocol=tcp -h127.0.0.1 -uroot -N -B -e "$q" | awk '{print $1" rows="$2}'
+        docker exec -i "$c" mysql --protocol=tcp -h127.0.0.1 -uroot -N -B -e "CHECKSUM TABLE ${tl%,};" | awk '{print $1" checksum="$2}'
     } | sort
 }
 
@@ -236,7 +236,7 @@ tablespaces() {
 stop_server() {
     local check=$1 volp=$2 vols=$3 d="$OUT/$SCN"
     log "$SCN: mysqladmin shutdown"
-    timeout 300 docker exec "$SRV" mysqladmin -uroot shutdown >>"$d/shutdown.txt" 2>&1
+    timeout 300 docker exec "$SRV" mysqladmin --protocol=tcp -h127.0.0.1 -uroot shutdown >>"$d/shutdown.txt" 2>&1
     if ! timeout 300 docker wait "$SRV" >"$d/exit-code.txt"; then
         log "$SCN: $SRV did not stop within 300 s, killing it"
         docker kill "$SRV" >/dev/null 2>&1
@@ -346,12 +346,12 @@ plain_check() {
         echo "== CHECK TABLE ... EXTENDED"
         local i
         for i in $(seq 1 "$TABLES"); do
-            docker exec "$CHK" mysql -uroot -N -B -e "CHECK TABLE sbtest.sbtest$i EXTENDED"
+            docker exec "$CHK" mysql --protocol=tcp -h127.0.0.1 -uroot -N -B -e "CHECK TABLE sbtest.sbtest$i EXTENDED"
         done
     } >"$d/plain-$label-check.txt" 2>&1
     table_report "$CHK" >"$d/report-$label.txt"
     ibd_report "$CHK" >"$d/ibd-$label.txt" 2>&1
-    docker exec "$CHK" mysqladmin -uroot shutdown >/dev/null 2>&1
+    docker exec "$CHK" mysqladmin --protocol=tcp -h127.0.0.1 -uroot shutdown >/dev/null 2>&1
     docker wait "$CHK" >/dev/null
     docker logs "$CHK" >"$d/plain-$label.log" 2>&1
     docker rm -f "$CHK" >/dev/null 2>&1
