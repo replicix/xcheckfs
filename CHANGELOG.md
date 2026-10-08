@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1]
+
+### Fixed
+
+- When xcheckfs runs out of file descriptors, both file systems still see
+  the same operations: a half that alone ran out is retried after freeing a
+  small descriptor reserve, instead of leaving the trees diverged and
+  reporting a false mismatch. Closing a file no longer fails with `EMFILE`.
+  A warning points at `RLIMIT_NOFILE`.
+- The libfuse `test_syscalls` script clones libfuse when no checkout is
+  given, and the external test scripts no longer require an offline crate
+  cache.
+
 ## [0.1.0]
 
 Initial release.
@@ -49,5 +62,6 @@ Initial release.
   `.rpm` packages, and an installer script.
 - Documentation in the Diátaxis layout under `docs/`.
 
-[Unreleased]: https://github.com/replicix/xcheckfs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/replicix/xcheckfs/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/replicix/xcheckfs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/replicix/xcheckfs/releases/tag/v0.1.0
