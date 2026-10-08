@@ -296,7 +296,13 @@ impl Backend for PosixBackend {
     fn flush(&self, file: BorrowedFd<'_>) -> SysResult<()> {
         // close(dup(fd)) makes the backend see a close(2), so a FUSE or
         // network backend runs its own flush logic and reports its errors.
-        let d = sys::dup(file)?;
+        // Best effort: when xcheckfs itself is out of descriptors the flush
+        // is skipped (the backend still sees the close at release), since a
+        // native close(2) never fails with EMFILE.
+        let d = match sys::dup(file) {
+            Err(libc::EMFILE | libc::ENFILE) => return Ok(()),
+            r => r?,
+        };
         let raw = std::os::fd::IntoRawFd::into_raw_fd(d);
         // SAFETY: we own `raw`.
         cvt(unsafe { libc::close(raw) }).map(drop)

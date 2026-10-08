@@ -137,10 +137,16 @@ How repair works: [Design](../explanation/DESIGN.md#repair-resync).
 
 ## Resources
 
-- Each cached inode holds **two `O_PATH` descriptors** (one per side).
-  `RLIMIT_NOFILE` is raised to the hard limit at start; xcheckfs warns when
-  that is below 65 536. Raise the hard limit (`LimitNOFILE=` under systemd)
-  for large trees.
+- Each cached inode holds **two `O_PATH` descriptors** (one per side), and
+  each file open through the mount two more. `RLIMIT_NOFILE` is raised to the
+  hard limit at start; xcheckfs warns when that is below 65 536. Raise the
+  hard limit (`LimitNOFILE=` under systemd) for large trees and for
+  applications that keep many files open.
+- When xcheckfs runs out of descriptors, applications get `EMFILE`. Both file
+  systems still see the same operations: when only one half of an operation
+  runs out, that half is retried after freeing a small reserve (running out
+  happens before a file system acts, so the retry is safe), and a close is
+  never failed for it. A warning is logged once.
 - Reads are compared in memory, so a read of N bytes holds up to 2N bytes
   (pooled buffers).
 

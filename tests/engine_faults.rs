@@ -1014,3 +1014,20 @@ fn ctime_of_a_file_without_links_is_not_compared() {
         h.assert_no_mismatches();
     }
 }
+
+/// Running out of descriptors is a limit of the xcheckfs process: when it strikes only one half of an operation
+/// (e.g. the secondary's open of a create), that half is retried after freeing the descriptor reserve, so both
+/// file systems see the operation and nothing is reported.
+#[test]
+fn descriptor_exhaustion_of_one_half_is_retried() {
+    for errno in [libc::EMFILE, libc::ENFILE] {
+        let h = prepared(B);
+        h.inject(Fault::new(FaultOp::Create, Effect::Errno(errno)).once());
+        h.write_file("/new", b"data");
+        h.pfault.add(Fault::new(FaultOp::Lookup, Effect::Errno(errno)).once());
+        h.try_lookup("/new").unwrap();
+        h.read_file("/new");
+        h.assert_no_mismatches();
+        h.assert_trees_equal();
+    }
+}

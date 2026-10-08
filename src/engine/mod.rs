@@ -247,6 +247,7 @@ pub struct Engine {
     slack: Slack,
     repairs: resync::Repairs,
     quarantine_seq: AtomicU64,
+    fd_reserve: FdReserve,
     /// Shadow of granted record locks and blocked requests (deadlock detection).
     pub(crate) lock_graph: Mutex<locks::WaitGraph>,
 }
@@ -325,6 +326,7 @@ impl Engine {
             slack: Slack::default(),
             repairs: resync::Repairs::default(),
             quarantine_seq: AtomicU64::new(0),
+            fd_reserve: FdReserve::new(),
             lock_graph: Mutex::new(locks::WaitGraph::default()),
         };
         e.stats.nodes.store(1, Relaxed);
@@ -510,6 +512,25 @@ impl Engine {
             let p = run(Side::Primary);
             (p, Some(run(Side::Secondary)))
         };
+        // Running out of descriptors is a limit of the xcheckfs process, not
+        // of a file system, and it strikes before the file system does
+        // anything: when only one half hit it, free the reserve and retry
+        // that half, so both file systems see the same operation.
+        let fd_short = |r: &SysResult<U>| matches!(r, Err(libc::EMFILE | libc::ENFILE));
+        let (p, s) = match s {
+            Some(sv) if fd_short(&p.0) != fd_short(&sv.0) => {
+                let side = if fd_short(&p.0) { Side::Primary } else { Side::Secondary };
+                let again = self.fd_reserve.with_released(|| run(side));
+                match side {
+                    Side::Primary => (again, Some(sv)),
+                    Side::Secondary => (p, Some(again)),
+                }
+            }
+            s => (p, s),
+        };
+        if fd_short(&p.0) || s.as_ref().is_some_and(|x| fd_short(&x.0)) {
+            self.fd_reserve.warn_once();
+        }
         cx.pns += p.1;
         cx.window_ns = cx.window_ns.max(p.2);
         let st = self.stats.op(cx.op);
@@ -858,6 +879,48 @@ impl Engine {
             "op"
         );
         res
+    }
+}
+
+/// A few descriptors held in reserve: freed for retrying the half of an
+/// operation that alone ran out of descriptors.
+struct FdReserve {
+    fds: Mutex<Vec<std::os::fd::OwnedFd>>,
+    warned: std::sync::Once,
+}
+
+const FD_RESERVE: usize = 32;
+
+impl FdReserve {
+    fn new() -> FdReserve {
+        let r = FdReserve { fds: Mutex::new(Vec::new()), warned: std::sync::Once::new() };
+        r.refill(&mut r.fds.lock());
+        r
+    }
+
+    fn refill(&self, fds: &mut Vec<std::os::fd::OwnedFd>) {
+        while fds.len() < FD_RESERVE {
+            match std::fs::File::open("/dev/null") {
+                Ok(f) => fds.push(f.into()),
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn with_released<T>(&self, f: impl FnOnce() -> T) -> T {
+        let mut fds = self.fds.lock();
+        fds.clear();
+        let r = f();
+        self.refill(&mut fds);
+        r
+    }
+
+    fn warn_once(&self) {
+        self.warned.call_once(|| {
+            tracing::warn!(
+                "xcheckfs is running out of file descriptors (two per cached inode and per open file): raise its RLIMIT_NOFILE (systemd: LimitNOFILE=)"
+            )
+        });
     }
 }
 
