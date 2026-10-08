@@ -1,0 +1,171 @@
+name: Applications
+
+# PostgreSQL, MySQL and multi-process SQLite on an xcheckfs mount in Docker
+# (tests/apps/): every configuration must end with no mismatch, identical
+# trees (`xcheckfs verify`) and a consistent database on each side. The
+# throughput and latency against a plain volume go to the job summary, a
+# comment on the pull request (compared with the latest main), and the
+# `apps-results` artifact. The release workflow runs it too.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
+  pull_request:
+    paths-ignore: ["docs/**", "**.md"]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apps-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Static binary
+    runs-on: ubuntu-24.04
+    env:
+      # musl C compiler for mimalloc
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Static: the database images are Debian, Oracle Linux and Alpine.
+      - name: Build
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: xcheckfs-static
+          path: target/x86_64-unknown-linux-musl/release/xcheckfs
+          retention-days: 7
+
+  app:
+    name: ${{ matrix.app }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [postgres, mysql, sqlite]
+    env:
+      OUT: ${{ github.workspace }}/out/${{ matrix.app }}
+      XCHECKFS: ${{ github.workspace }}/bin/xcheckfs
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: xcheckfs-static
+          path: bin
+
+      - name: Prepare
+        run: |
+          chmod +x bin/xcheckfs
+          mkdir -p "$OUT"
+          bin/xcheckfs --version
+
+      - name: Run ${{ matrix.app }}
+        run: tests/apps/${{ matrix.app }}/run.sh ci
+
+      - name: Summary
+        if: always()
+        run: tests/apps/report.py "$OUT" >>"$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload results and logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: apps-${{ matrix.app }}
+          path: out/${{ matrix.app }}
+          retention-days: 14
+
+  report:
+    name: Report
+    needs: app
+    if: always() && needs.app.result != 'skipped'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: apps-*
+          path: results
+
+      # The newest main run that has results to compare with.
+      - name: Results of main
+        id: base
+        if: github.event_name == 'pull_request'
+        run: |
+          for row in $(gh run list --workflow apps.yml --branch main --event push --limit 20 \
+              --json databaseId,headSha --jq '.[] | "\(.databaseId):\(.headSha)"'); do
+            if gh run download "${row%%:*}" --name apps-results --dir base 2>/dev/null; then
+              echo "sha=${row#*:}" >>"$GITHUB_OUTPUT"
+              echo "run=${row%%:*}" >>"$GITHUB_OUTPUT"
+              break
+            fi
+          done
+
+      - name: Report
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          BASE_RUN: ${{ steps.base.outputs.run }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          server=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+          meta="commit [\`${SHA::7}\`]($server/commit/$SHA) · [run]($server/actions/runs/$GITHUB_RUN_ID) · GitHub ubuntu-24.04 runner (4 vCPU)"
+          if [[ -n $BASE_SHA ]]; then
+            meta+=" · compared with main at [\`${BASE_SHA::7}\`]($server/actions/runs/$BASE_RUN)"
+          fi
+          base=()
+          [[ -d base ]] && base=(--base base)
+          rc=0
+          tests/apps/report.py results "${base[@]}" --meta "$meta" --fail-on-error >report.md || rc=$?
+          cat report.md >>"$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      # One comment per pull request, updated in place. Pull requests from
+      # forks get a read-only token: the job summary has the same report.
+      - name: Comment on the pull request
+        if: always() && github.event_name == 'pull_request' && hashFiles('report.md') != ''
+        continue-on-error: true
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          id=$(gh api "repos/$GH_REPO/issues/$PR/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- xcheckfs-app-benchmarks -->"))) | .id' | tail -n 1)
+          if [[ -n $id ]]; then
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$id" -F body=@report.md >/dev/null
+          else
+            gh api --method POST "repos/$GH_REPO/issues/$PR/comments" -F body=@report.md >/dev/null
+          fi
+
+      # Results of main, for the pull requests to compare with.
+      - name: Keep the results of main
+        if: always() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-artifact@v6
+        with:
+          name: apps-results
+          path: results/*/results.json
+          retention-days: 90

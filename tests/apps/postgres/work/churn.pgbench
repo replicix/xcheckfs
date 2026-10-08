@@ -1,0 +1,19 @@
+-- UPDATE / DELETE / INSERT churn over accounts, 200 partitions and a queue table.
+\set aid random(1, 100000 * :scale)
+\set delta random(-5000, 5000)
+\set k random(1, 400000)
+\set len random(1, 60)
+\set r random(1, 100)
+BEGIN;
+UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid;
+\if :r <= 25
+DELETE FROM xc_part WHERE k = :k;
+\elif :r <= 70
+INSERT INTO xc_part (k, payload) VALUES (:k, repeat(md5((:k)::text), :len)) ON CONFLICT (k) DO UPDATE SET payload = excluded.payload, n = xc_part.n + 1;
+\else
+UPDATE xc_part SET n = n + 1, payload = repeat(md5((:k)::text), :len) WHERE k = :k;
+\endif
+INSERT INTO xc_churn (payload) VALUES (repeat('c', :len * 50));
+DELETE FROM xc_churn WHERE id = currval('xc_churn_id_seq') - 20000;
+INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (1, 1, :aid, :delta, CURRENT_TIMESTAMP);
+END;

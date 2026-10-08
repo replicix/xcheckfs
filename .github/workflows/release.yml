@@ -1,8 +1,9 @@
 name: Release
 
-# Push a tag `vX.Y.Z` matching the version in Cargo.toml: the tests run, the
-# static Linux binaries and packages are built, and a GitHub release with all
-# of them (plus install.sh and SHA256SUMS) is published.
+# Push a tag `vX.Y.Z` matching the version in Cargo.toml: the tests and the
+# application tests run, the static Linux binaries and packages are built, and
+# a GitHub release with all of them (plus install.sh and SHA256SUMS) is
+# published.
 on:
   push:
     tags: ["v[0-9]*"]
@@ -18,10 +19,17 @@ jobs:
   test:
     uses: ./.github/workflows/ci.yml
 
+  apps:
+    uses: ./.github/workflows/apps.yml
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+
   # Each target is built natively on a runner of its architecture.
   build:
     name: Build ${{ matrix.target }}
-    needs: test
+    needs: [test, apps]
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
