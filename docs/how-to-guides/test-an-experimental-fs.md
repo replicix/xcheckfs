@@ -73,6 +73,16 @@ to the primary or the secondary.
 xcheckfs mount --ui tui --quarantine /var/tmp/xcheckfs-quarantine /mnt /home /experimental
 ```
 
+At mount, xcheckfs probes both trees (a few operations in a scratch directory
+at each root, removed again; the roots' ctime changes) and tells you what it
+found: choices POSIX leaves to the file system, on which the two differ, are
+adapted to instead of reported (logged at info level, listed under
+`info.adaptations`); `fallocate` modes only one of them supports are logged at
+warn level with the allow rule that accepts them, and listed under
+`info.capability_gaps`. Check both with `xcheckfs ctl MNT status` after the
+mount; add the rule only if the gap is acceptable. `--no-probe` switches this
+off ([Known differences](../reference/fs-differences.md#the-mount-time-probe)).
+
 Unattended: add `--background --log-file /var/log/xcheckfs.log` (the log file
 must be outside the trees) and watch with `ctl`.
 

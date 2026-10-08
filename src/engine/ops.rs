@@ -22,6 +22,57 @@ const XATTR_MAX: usize = 65536;
 impl Engine {
     // ------------------------------------------------------------- helpers
 
+    fn relaxed(&self) -> bool {
+        self.cfg.serialize == crate::config::Serialization::Relaxed
+    }
+
+    /// Relaxed serialization: the stripes of `nodes` shared, then their byte
+    /// ranges (one request per object, objects in id order: ranges are only
+    /// ever taken after all stripes, and in this order, so waits cannot form
+    /// a cycle). Exclusive ranges mark the object as having a data operation
+    /// in flight. Only for operations that change neither size nor metadata:
+    /// the caller must have checked that against the primary under a shared
+    /// stripe.
+    fn lock_ranges<'a>(&'a self, metas: LockSet<'a>, ranges: &[(&'a Node, u64, u64, bool)]) -> DataLocks<'a> {
+        let mut sorted: Vec<&(&Node, u64, u64, bool)> = ranges.iter().collect();
+        sorted.sort_by_key(|r| (r.0.id, r.1));
+        let mut guards = Vec::with_capacity(sorted.len());
+        let mut inflight = Vec::new();
+        let mut i = 0;
+        while i < sorted.len() {
+            // all the ranges of one object are one request (see `RangeLocks::lock_many`)
+            let n = sorted[i].0;
+            let j = sorted[i..].iter().position(|r| r.0.id != n.id).map_or(sorted.len(), |k| i + k);
+            let group: Vec<(u64, u64, bool)> = sorted[i..j].iter().map(|r| (r.1, r.2, r.3)).collect();
+            let (g, waited) = n.ranges.lock_many(&group);
+            if waited {
+                self.stats.range_waits.fetch_add(1, Relaxed);
+            }
+            guards.push(g);
+            if group.iter().any(|r| r.2) {
+                let d = n.data.enter();
+                if d.concurrent {
+                    self.stats.concurrent_data_ops.fetch_add(1, Relaxed);
+                }
+                inflight.push(d);
+                // the stamps of this write may land anywhere in its window
+                Engine::touched_new(n.id);
+            }
+            i = j;
+        }
+        DataLocks { _metas: metas, _ranges: guards, _inflight: inflight }
+    }
+
+    /// The primary's current size through an open descriptor (stable while
+    /// the object's stripe is held: only exclusive holders change sizes), or
+    /// `None` when a data operation on the file must not run under a byte
+    /// range alone: a file with set-uid / set-gid bits loses them when an
+    /// unprivileged user writes to it, which is a mode change that a
+    /// concurrent getattr could see on one file system only.
+    fn inplace_size(&self, fd: std::os::fd::BorrowedFd<'_>) -> Option<u64> {
+        self.b[0].stat(fd).ok().filter(|st| st.mode & (libc::S_ISUID | libc::S_ISGID) == 0).map(|st| st.size)
+    }
+
     /// Locks `base` plus the children named in `children` (looked up on the
     /// primary), re-validating after locking that the names still refer to
     /// the same inodes. Returns the primary stats of the children.
@@ -95,7 +146,8 @@ impl Engine {
             }
         if let Some((sfd, sst)) = s {
             if n.has_sec() {
-                self.cmp_stat(cx, n, pst, &sst, excl, cx_what(cx.op))?;
+                let snap = cx.stat_snap.filter(|(id, _)| *id == n.id).map(|(_, s)| s);
+                self.cmp_stat_since(cx, n, pst, &sst, excl, cx_what(cx.op), snap)?;
             } else if sst.kind() == n.kind
                 && self.secondary_claimed_by_other(sst.ident(), id).is_none()
                 && !self.detached()
@@ -109,7 +161,8 @@ impl Engine {
                 self.nodes.set_secondary(n, Some((sfd, sst.ident())));
                 *n.ctimes.lock() = None;
                 tracing::info!("{}: reconnected to the secondary", self.path_of(n));
-                self.cmp_stat(cx, n, pst, &sst, excl, cx_what(cx.op))?;
+                let snap = cx.stat_snap.filter(|(id, _)| *id == n.id).map(|(_, s)| s);
+                self.cmp_stat_since(cx, n, pst, &sst, excl, cx_what(cx.op), snap)?;
             }
         }
         Ok(())
@@ -308,7 +361,10 @@ impl Engine {
         self.run(OpKind::Lookup, parent, || self.detail_name(parent, name), |cx| {
             let pn = self.node(parent)?;
             let c = cname(name)?;
-            let (_l, _) = self.lock_children(&[(parent, false)], &[(&pn, &c)], false);
+            let (_l, cands) = self.lock_children(&[(parent, false)], &[(&pn, &c)], false);
+            cx.stat_snap = cands[0]
+                .and_then(|st| self.nodes.get(self.map_ino(st.ino)))
+                .map(|n| (n.id, n.data.snap()));
             let sec = self.sec_for(&[&pn]);
             let (p, s) = self.both(cx, sec, None, |side, be| be.lookup(pn.fd(side).as_fd(), &c));
             self.cmp_result(cx, &pn, Some(name), &p, &s, false)?;
@@ -331,11 +387,12 @@ impl Engine {
             let n = self.node(ino)?;
             let _l = self.lock(&[(ino, false)]);
             let sec = self.sec_for(&[&n]);
+            let snap = n.data.snap();
             let (p, s) = self.both(cx, sec, None, |side, be| be.stat(n.fd(side).as_fd()));
             self.cmp_result(cx, &n, None, &p, &s, false)?;
             let pst = p?;
             if let Some(Ok(sst)) = &s {
-                self.cmp_stat(cx, &n, &pst, sst, false, "getattr")?;
+                self.cmp_stat_since(cx, &n, &pst, sst, false, "getattr", Some(snap))?;
             }
             Ok(Attr { id: n.id, st: pst })
         })
@@ -360,12 +417,20 @@ impl Engine {
                 p?;
             }
             if let Some(size) = a.size {
+                // A truncate to the current size: whether it stamps mtime is up to the file system (the probe
+                // found the two differ)
+                let align = a.mtime.is_none()
+                    && self.adapt.truncate_same_size_mtime.needed(file.is_some(), size)
+                    && self.b[0].stat(n.p()).is_ok_and(|st| st.size == size);
                 let (p, s) = self.both(cx, sec, creds, |side, be| {
                     let f = file.as_ref().filter(|f| side == Side::Primary || f.has_sec());
                     be.truncate(n.fd(side).as_fd(), f.map(|f| f.fd(side)), size)
                 });
                 self.cmp_result(cx, &n, None, &p, &s, true)?;
                 p?;
+                if align && matches!(s, Some(Ok(()))) {
+                    self.align_mtime_node(&n);
+                }
             }
             if a.atime.is_some() || a.mtime.is_some() {
                 let at = a.atime.unwrap_or(TimeSpec::Omit);
@@ -610,6 +675,18 @@ impl Engine {
                 });
                 self.cmp_result(cx, &pn, Some(name), &p, &s, true)?;
                 p?;
+                // A directory that moved to another parent: whether its own mtime is stamped is up to the file
+                // system (the probe found the two differ)
+                if matches!(s, Some(Ok(()))) && newparent != parent {
+                    if flags & libc::RENAME_EXCHANGE != 0 {
+                        if self.adapt.exchanged_dir_mtime {
+                            self.align_mtime_at(&npn, &nc);
+                            self.align_mtime_at(&pn, &c);
+                        }
+                    } else if self.adapt.moved_dir_mtime {
+                        self.align_mtime_at(&npn, &nc);
+                    }
+                }
                 if let Some(src) = cands[0].and_then(|st| self.nodes.get(self.map_ino(st.ino))) {
                     src.set_hint(Engine::child_hint(&npn, newname));
                 }
@@ -714,7 +791,15 @@ impl Engine {
         let pb = self.run(OpKind::Read, ino, || format!("{} off={off} len={size}", self.detail_ino(ino)), |cx| {
             let f = self.file(fh)?;
             let n = &f.node;
-            let _l = self.lock(&[(n.id, false)]);
+            // Relaxed: the read's byte range shared, so in-place writes to
+            // other ranges proceed concurrently (the size cannot change while
+            // the stripe is held shared).
+            let m = self.lock(&[(n.id, false)]);
+            let _l = if self.relaxed() {
+                DataGuard::Ranged(self.lock_ranges(m, &[(n, off, off.saturating_add(size as u64), false)]))
+            } else {
+                DataGuard::Exclusive(m)
+            };
             let sec = !self.detached() && f.has_sec();
             if !sec && !self.detached() {
                 self.stats.secondary_skipped.fetch_add(1, Relaxed);
@@ -762,7 +847,22 @@ impl Engine {
         self.run(OpKind::Write, ino, || format!("{} off={off} len={}", self.detail_ino(ino), data.len()), |cx| {
             let f = self.file(fh)?;
             let n = &f.node;
-            let _l = self.lock(&[(n.id, true)]);
+            // Relaxed: an in-place write (not O_APPEND, ending within the
+            // primary's size) holds only its byte range; writes that may
+            // extend the file stay exclusive.
+            let end = off.saturating_add(data.len() as u64);
+            let _l = if self.relaxed() && f.flags & libc::O_APPEND == 0 {
+                let m = self.lock(&[(n.id, false)]);
+                if self.inplace_size(f.pfd.as_fd()).is_some_and(|size| end <= size) {
+                    DataGuard::Ranged(self.lock_ranges(m, &[(n, off, end, true)]))
+                } else {
+                    drop(m);
+                    DataGuard::Exclusive(self.lock(&[(n.id, true)]))
+                }
+            } else {
+                DataGuard::Exclusive(self.lock(&[(n.id, true)]))
+            };
+            let started = sys::Ts::from_system_time(std::time::SystemTime::now());
             let sec = !self.detached() && f.has_sec();
             let (p, s) = self.both(cx, sec, None, |side, be| be.pwrite(f.fd(side).as_fd(), data, off));
             self.cmp_result(cx, n, None, &p, &s, true)?;
@@ -793,6 +893,21 @@ impl Engine {
                     Err(e) => Err(sys::fmt_errno(e)),
                 };
                 self.verify_sides(cx, n, None, "write read-back", chk(a, pn), b.map(|b| chk(b, sn.unwrap())), true)?;
+                // Each file system must have stamped mtime for this write (or a
+                // concurrent one): this catches a file system that does not
+                // update mtime even when racing stats skip the comparison.
+                if pn > 0 && sn.is_some_and(|k| k > 0) {
+                    // (file systems stamp with a coarse clock that lags the wall clock by up to a tick: a tolerance
+                    // of nothing would report healthy file systems)
+                    let tol = self.cfg.time_tolerance.max(std::time::Duration::from_millis(50)).as_nanos() as i128;
+                    let (a, b) = self.both(cx, true, None, |side, be| be.stat(f.fd(side).as_fd()));
+                    let chk = |r: SysResult<Stat>| match r {
+                        Ok(st) if st.mtime.as_nanos() + tol >= started.as_nanos() => Ok(()),
+                        Ok(st) => Err(format!("mtime {} not updated by the write at {started}", st.mtime)),
+                        Err(e) => Err(sys::fmt_errno(e)),
+                    };
+                    self.verify_sides(cx, n, None, "write mtime", chk(a), b.map(chk), true)?;
+                }
             }
             Ok(pn as u32)
         })
@@ -820,7 +935,13 @@ impl Engine {
             self.stats.open_files.fetch_sub(1, Relaxed);
             let n = f.node.clone();
             let res = if self.paranoid() && f.written.load(Relaxed) && f.has_sec() {
-                let _l = self.lock(&[(n.id, false)]);
+                // the whole file must be stable: no in-place write in flight
+                let m = self.lock(&[(n.id, false)]);
+                let _l = if self.relaxed() {
+                    DataGuard::Ranged(self.lock_ranges(m, &[(&n, 0, u64::MAX, false)]))
+                } else {
+                    DataGuard::Exclusive(m)
+                };
                 self.compare_content(cx, &n, false)
             } else {
                 Ok(())
@@ -853,17 +974,46 @@ impl Engine {
         self.run(OpKind::Fallocate, ino, || format!("{} off={off} len={len} mode={mode:#x}", self.detail_ino(ino)), |cx| {
             let f = self.file(fh)?;
             let n = &f.node;
-            let _l = self.lock(&[(n.id, true)]);
+            // Relaxed: modes that keep the size (KEEP_SIZE, which PUNCH_HOLE
+            // implies, or a range inside the file) hold only their range.
+            let end = off.saturating_add(len);
+            let reshape = mode & (libc::FALLOC_FL_COLLAPSE_RANGE | libc::FALLOC_FL_INSERT_RANGE) != 0;
+            // A hole punched where there is no data: whether that stamps mtime is up to the file system (the
+            // probe found the two differ). The secondary's mtime is then set to the primary's, with the file held
+            // exclusively (a concurrent write must not stamp it in between).
+            let punch_align = self.adapt.punch_hole_in_hole_mtime && mode & libc::FALLOC_FL_PUNCH_HOLE != 0;
+            let _l = if self.relaxed() && !reshape && !punch_align {
+                let m = self.lock(&[(n.id, false)]);
+                let keeps_size = mode & libc::FALLOC_FL_KEEP_SIZE != 0
+                    || self.inplace_size(f.pfd.as_fd()).is_some_and(|size| end <= size);
+                if keeps_size {
+                    DataGuard::Ranged(self.lock_ranges(m, &[(n, off, end, true)]))
+                } else {
+                    drop(m);
+                    DataGuard::Exclusive(self.lock(&[(n.id, true)]))
+                }
+            } else {
+                DataGuard::Exclusive(self.lock(&[(n.id, true)]))
+            };
             let sec = !self.detached() && f.has_sec();
+            let in_hole = punch_align
+                && match self.b[0].lseek(f.pfd.as_fd(), off as i64, libc::SEEK_DATA) {
+                    Ok(d) => d as u64 >= end,
+                    Err(e) => e == libc::ENXIO,
+                };
             let (p, s) = self.both(cx, sec, None, |side, be| be.fallocate(f.fd(side).as_fd(), mode, off, len));
             self.cmp_result(cx, n, None, &p, &s, true)?;
             p?;
+            if in_hole && matches!(s, Some(Ok(()))) {
+                self.align_mtime_node(n);
+            }
             f.written.store(true, Relaxed);
             if self.thorough() && matches!(s, Some(Ok(()))) && n.has_sec() {
+                let snap = n.data.snap();
                 let (a, b) = self.both(cx, true, None, |side, be| be.stat(n.fd(side).as_fd()));
                 self.cmp_result(cx, n, None, &a, &b, true)?;
                 if let (Ok(a), Some(Ok(b))) = (a, b) {
-                    self.cmp_stat(cx, n, &a, &b, true, "after fallocate")?;
+                    self.cmp_stat_since(cx, n, &a, &b, true, "after fallocate", Some(snap))?;
                 }
                 if mode & (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE) != 0 {
                     let l = len.min(VERIFY_CAP) as usize;
@@ -886,7 +1036,14 @@ impl Engine {
         self.run(OpKind::Lseek, ino, || format!("{} off={off} whence={whence}", self.detail_ino(ino)), |cx| {
             let f = self.file(fh)?;
             let n = &f.node;
-            let _l = self.lock(&[(n.id, false)]);
+            let m = self.lock(&[(n.id, false)]);
+            // SEEK_DATA / SEEK_HOLE see which parts of the file hold data (even ENXIO depends on it): an in-place
+            // write into a hole must not be half done meanwhile. The whole file's range, shared.
+            let _l = if self.relaxed() && (whence == libc::SEEK_DATA || whence == libc::SEEK_HOLE) {
+                DataGuard::Ranged(self.lock_ranges(m, &[(n, 0, u64::MAX, false)]))
+            } else {
+                DataGuard::Exclusive(m)
+            };
             let sec = !self.detached() && f.has_sec();
             let (p, s) = self.both(cx, sec, None, |side, be| be.lseek(f.fd(side).as_fd(), off, whence));
             self.cmp_result(cx, n, None, &p, &s, false)?;
@@ -915,10 +1072,41 @@ impl Engine {
         len: u64,
         flags: u32,
     ) -> Result<u32, i32> {
-        self.run(OpKind::CopyFileRange, 0, || format!("fh {fh_in}@{off_in} -> fh {fh_out}@{off_out} len={len}"), |cx| {
+        self.run(OpKind::CopyFileRange, 0, || {
+            let ino = |fh| self.file(fh).map_or(0, |f| f.node.id);
+            format!("fh {fh_in} (ino {})@{off_in} -> fh {fh_out} (ino {})@{off_out} len={len}", ino(fh_in), ino(fh_out))
+        }, |cx| {
             let fi = self.file(fh_in)?;
             let fo = self.file(fh_out)?;
-            let _l = self.lock(&[(fi.node.id, false), (fo.node.id, true)]);
+            // Relaxed: source range shared, destination range exclusive, when
+            // the copy stays inside the destination and the two ranges of a
+            // same-file copy do not overlap.
+            let (ni, no) = (&fi.node, &fo.node);
+            let span = len.min(u32::MAX as u64);
+            let (src, dst) = ((off_in, off_in.saturating_add(span)), (off_out, off_out.saturating_add(span)));
+            let overlapping = ni.id == no.id && src.0 < dst.1 && dst.0 < src.1;
+            // (with the destination exclusive, the source is still held only shared: in relaxed mode in-place
+            // writers hold the same, so the source range must be locked too, or the two halves of the copy could
+            // read different data)
+            let exclusive = || {
+                let m = self.lock(&[(ni.id, false), (no.id, true)]);
+                if self.relaxed() && ni.id != no.id {
+                    DataGuard::Ranged(self.lock_ranges(m, &[(ni, src.0, src.1, false)]))
+                } else {
+                    DataGuard::Exclusive(m)
+                }
+            };
+            let _l = if self.relaxed() && !overlapping {
+                let m = self.lock(&[(ni.id, false), (no.id, false)]);
+                if self.inplace_size(fo.pfd.as_fd()).is_some_and(|size| dst.1 <= size) {
+                    DataGuard::Ranged(self.lock_ranges(m, &[(ni, src.0, src.1, false), (no, dst.0, dst.1, true)]))
+                } else {
+                    drop(m);
+                    exclusive()
+                }
+            } else {
+                exclusive()
+            };
             let sec = !self.detached() && fi.has_sec() && fo.has_sec();
             let l = len.min(u32::MAX as u64) as usize;
             // copy_file_range may legitimately copy less than asked, and file
@@ -968,7 +1156,18 @@ impl Engine {
                     if let (Ok(a), Some(Ok(b))) = (a, b) {
                         self.stats.verifications.fetch_add(1, Relaxed);
                         if let Some(d) = compare::diff_data(off_out, &a, &b) {
-                            self.report(cx, &fo.node, MismatchKind::Verify, Some("copied range".into()), String::new(), String::new(), d, true)?;
+                            // Where it went wrong: the sources already differed, or one side's copy is not its source.
+                            let (sa, sb) = self.both(cx, true, None, |side, be| self.read_back(be, &fi.node, side, off_in, k));
+                            let src = match (sa, sb) {
+                                (Ok(sa), Some(Ok(sb))) => format!(
+                                    "; source ranges {}; primary copy {} its source, secondary copy {} its source",
+                                    if sa == sb { "equal" } else { "differ" },
+                                    if sa == a { "equals" } else { "differs from" },
+                                    if sb == b { "equals" } else { "differs from" },
+                                ),
+                                _ => String::new(),
+                            };
+                            self.report(cx, &fo.node, MismatchKind::Verify, Some("copied range".into()), String::new(), String::new(), d + &src, true)?;
                         }
                     }
                 }
@@ -1256,4 +1455,20 @@ fn cx_what(op: OpKind) -> &'static str {
 /// layer handles the caller-visible part.
 fn sanitize_open_flags(flags: i32) -> i32 {
     flags & !(libc::O_DIRECT | libc::O_NOCTTY)
+}
+
+/// Locks held by a data operation under relaxed serialization (dropped in
+/// reverse: in-flight marks, ranges, then the stripes).
+struct DataLocks<'a> {
+    _inflight: Vec<super::ranges::DataOpGuard<'a>>,
+    _ranges: Vec<super::ranges::RangeGuard<'a>>,
+    _metas: LockSet<'a>,
+}
+
+/// Either the object exclusively (strict, or an operation that changes the
+/// size) or shared stripes plus byte ranges.
+#[allow(dead_code)]
+enum DataGuard<'a> {
+    Exclusive(LockSet<'a>),
+    Ranged(DataLocks<'a>),
 }

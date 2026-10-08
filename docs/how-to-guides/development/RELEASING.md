@@ -18,8 +18,9 @@ Releases are built and published by GitHub Actions
 
 The workflow then:
 
-1. runs the CI checks (`clippy -D warnings`, `cargo test`) — a failure stops
-   the release;
+1. runs the CI checks (`clippy -D warnings`, `cargo test`) and the
+   application tests (`apps.yml`: PostgreSQL, MySQL and SQLite on a mount in
+   Docker) — a failure stops the release;
 2. refuses to continue if the tag is not `v` + the `Cargo.toml` version;
 3. builds static musl binaries for `x86_64-unknown-linux-musl` and
    `aarch64-unknown-linux-musl`, each natively on a runner of its

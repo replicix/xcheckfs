@@ -10,6 +10,26 @@ with the primary.
 suite (no root needed) and pjdfstest (root) through a mount and fail on any
 mismatch; see [tests/external/README.md](../../tests/external/README.md).
 
+## Application tests of xcheckfs
+
+The `Applications` workflow (`.github/workflows/apps.yml`) runs PostgreSQL,
+MySQL and multi-process SQLite on an xcheckfs mount in Docker
+([tests/apps/README.md](../../tests/apps/README.md)) on pushes to `main`,
+pull requests (except documentation-only ones) and by hand, and the release
+workflow waits for it. Each application must end with no mismatch, identical
+trees (`xcheckfs verify`) and a consistent database on each side. It also
+reports throughput and latency against a plain volume:
+
+- the job summary of the run;
+- one comment per pull request, updated in place, that compares with the
+  latest `main` run that has results (for pull requests from forks, whose
+  token is read-only, the job summary has the same report);
+- artifacts: `apps-<app>` (results and logs of every run) and, from `main`,
+  `apps-results` (the `results.json` files later pull requests compare with).
+
+Use the same pattern for your own workload: `run.sh ci` of a harness is a
+template, and `tests/apps/report.py` renders any `results.json`.
+
 ## Recipe
 
 `fail` mode returns `EIO` at the first mismatch, so the workload itself
@@ -47,10 +67,16 @@ xcheckfs verify "$P" "$S"; VERIFY=$?          # 0 identical, 3 differences, 2 un
 
 ## Choices
 
+- **Serialization**: the default, `--serialize relaxed`, lets in-place
+  writes to disjoint ranges of one file reach the secondary concurrently,
+  which is what exposes its concurrency bugs; keep it for CI. A stat that
+  races such a write does not compare `mtime`/`ctime`
+  ([Checks](../reference/checks.md#racy-stats)). `--serialize strict` is the
+  fallback if you need to rule concurrency out.
 - **Check level**: `thorough` or `paranoid` ([Checks](../reference/checks.md)).
 - **Coverage vs. caching**: by default the kernel caches attributes, entries
   and pages, and cached answers are not re-checked. Add
-  `--attr-timeout 0 --entry-timeout 0 --direct-io` for maximal coverage,
+  `--attr-timeout 0 --entry-timeout 0 --direct-io all` for maximal coverage,
   unless the workload uses shared writable `mmap`
   ([Limitations](../reference/limitations.md#caching)).
 - **Expected differences**: keep an [allow-rules file](../reference/rules.md)

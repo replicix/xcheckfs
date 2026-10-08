@@ -109,6 +109,7 @@ pub struct HarnessBuilder {
     sbase: PathBuf,
     tweak: Option<Tweak>,
     events: Option<usize>,
+    pre_faults: Vec<Fault>,
 }
 
 impl HarnessBuilder {
@@ -135,6 +136,12 @@ impl HarnessBuilder {
         self.sbase = s.to_path_buf();
         self
     }
+    /// A fault on the secondary from the start: the engine's mount-time probe sees it too (to make the secondary
+    /// behave like another kind of file system).
+    pub fn secondary_fault(mut self, f: Fault) -> Self {
+        self.pre_faults.push(f);
+        self
+    }
     pub fn config(mut self, f: impl FnOnce(&mut EngineConfig) + 'static) -> Self {
         self.tweak = Some(Box::new(f));
         self
@@ -159,6 +166,10 @@ impl HarnessBuilder {
         let pfault = FaultBackend::new(pbe);
         let fault = FaultBackend::new(sbe);
         let mut cfg = EngineConfig { check: self.level, ..EngineConfig::default() };
+        // `XCHECKFS_SERIALIZE=strict cargo test` runs every test (that does not choose itself) in strict mode.
+        if std::env::var("XCHECKFS_SERIALIZE").is_ok_and(|v| v == "strict") {
+            cfg.serialize = xcheckfs::config::Serialization::Strict;
+        }
         if let Some(t) = self.tweak {
             t(&mut cfg);
         }
@@ -171,6 +182,9 @@ impl HarnessBuilder {
             }
             None => (EventSink::disabled(), None),
         };
+        for f in self.pre_faults {
+            fault.add(f);
+        }
         let policy = Arc::new(Policy::new(self.mode, self.rules, None, false, sink.clone(), stats.clone()).unwrap());
         let engine = Arc::new(
             Engine::new(cfg, pfault.clone(), fault.clone(), policy.clone(), stats.clone(), sink).unwrap(),
@@ -203,17 +217,26 @@ pub struct Fh {
     pub fh: u64,
 }
 
+/// Where the two trees of a test live: `XCHECKFS_TEST_PRIMARY` and `XCHECKFS_TEST_SECONDARY` (directories, for
+/// example on two different file systems), each defaulting to [`fast_base`]. Tests that choose their own bases
+/// keep them.
+pub fn test_bases() -> (PathBuf, PathBuf) {
+    let base = |var: &str| std::env::var_os(var).map(PathBuf::from).unwrap_or_else(fast_base);
+    (base("XCHECKFS_TEST_PRIMARY"), base("XCHECKFS_TEST_SECONDARY"))
+}
+
 impl Harness {
     pub fn builder() -> HarnessBuilder {
-        let base = fast_base();
+        let (pbase, sbase) = test_bases();
         HarnessBuilder {
             level: CheckLevel::Basic,
             mode: MismatchMode::Log,
             rules: vec![],
-            pbase: base.clone(),
-            sbase: base,
+            pbase,
+            sbase,
             tweak: None,
             events: None,
+            pre_faults: Vec::new(),
         }
     }
 

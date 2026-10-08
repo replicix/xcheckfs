@@ -132,7 +132,12 @@ pub fn verify(
         p_root: primary,
         s_root: secondary,
         opts,
-        rules: AttrRules { time_tolerance: opts.time_tolerance, dir_nlink: opts.dir_nlink, mtime: opts.mtime },
+        // (a directory link count of 1 means the file system does not count subdirectories, btrfs for one)
+        rules: AttrRules {
+            time_tolerance: opts.time_tolerance,
+            dir_nlink: opts.dir_nlink && ps.nlink != 1 && ss.nlink != 1,
+            mtime: opts.mtime,
+        },
         p_dev: ps.dev,
         s_dev: ss.dev,
         files: AtomicU64::new(0),
@@ -336,7 +341,13 @@ impl Ctx<'_> {
     }
 
     fn compare_xattrs(&self, rel: &[u8], pp: &Path, sp: &Path) {
-        let (pa, sa) = match (read_xattrs(pp), read_xattrs(sp)) {
+        // SELinux labels are assigned by the policy for each mount, not kept by the file system: two healthy
+        // file systems mounted with different contexts label the same files differently.
+        let labels = |mut v: Vec<(Vec<u8>, Vec<u8>)>| {
+            v.retain(|(n, _)| n != b"security.selinux");
+            v
+        };
+        let (pa, sa) = match (read_xattrs(pp).map(labels), read_xattrs(sp).map(labels)) {
             (Ok(p), Ok(s)) => (p, s),
             (Err(e), _) => return self.error(rel, format!("xattr primary: {}", sys::fmt_errno(e))),
             (_, Err(e)) => return self.error(rel, format!("xattr secondary: {}", sys::fmt_errno(e))),

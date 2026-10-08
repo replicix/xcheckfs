@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::Level;
 
 use xcheckfs::backend::posix::PosixBackend;
-use xcheckfs::config::{CheckLevel, EngineConfig, MismatchMode};
+use xcheckfs::config::{CheckLevel, DirectIo, EngineConfig, MismatchMode, Serialization};
 use xcheckfs::control;
 use xcheckfs::engine::Engine;
 use xcheckfs::events::EventSink;
@@ -132,7 +132,8 @@ struct MountArgs {
     #[arg(long)]
     control_socket: Option<PathBuf>,
 
-    /// FUSE worker threads [default: number of CPUs, at most 16].
+    /// FUSE worker threads [default: twice the number of CPUs, at least 16,
+    /// at most 64].
     #[arg(long)]
     threads: Option<usize>,
     /// Run the secondary half of each operation after the primary instead of
@@ -145,6 +146,13 @@ struct MountArgs {
     /// Do not compare link counts of directories.
     #[arg(long)]
     no_dir_nlink: bool,
+    /// Do not probe the file systems at mount time. The probe (a few
+    /// operations in a scratch directory at the root of each tree, removed
+    /// again) finds where they legitimately differ, which xcheckfs then
+    /// adapts to instead of reporting it, and which optional operations only
+    /// one of them supports.
+    #[arg(long)]
+    no_probe: bool,
     /// Do not switch to the caller's credentials for mutations (root only).
     #[arg(long)]
     no_creds: bool,
@@ -157,10 +165,21 @@ struct MountArgs {
     /// Kernel dentry cache timeout in seconds.
     #[arg(long, default_value_t = 1.0)]
     entry_timeout: f64,
-    /// Bypass the kernel page cache so every read/write reaches xcheckfs
-    /// (breaks shared writable mmap).
-    #[arg(long)]
-    direct_io: bool,
+    /// Kernel direct-I/O path for: `auto` files opened with O_DIRECT (with
+    /// parallel direct writes), `all` every file (every read and write
+    /// reaches xcheckfs), `off` none. `--direct-io` alone means `all`.
+    #[arg(long, value_enum, num_args = 0..=1, default_value_t = DirectIo::Auto, default_missing_value = "all")]
+    direct_io: DirectIo,
+    /// How strictly operations on one object are serialized: `relaxed` lets
+    /// in-place reads and writes on disjoint byte ranges of a file run
+    /// concurrently on both file systems (anything changing the size stays
+    /// exclusive); `strict` serializes all writes per file.
+    #[arg(long, value_enum, default_value_t = Serialization::Relaxed)]
+    serialize: Serialization,
+    /// Lock stripes (objects whose ids hash to one stripe serialize each
+    /// other's exclusive operations).
+    #[arg(long, default_value_t = 65536)]
+    lock_stripes: usize,
     /// Allow other users to access the mount [default: on when root].
     #[arg(long, overrides_with = "no_allow_other")]
     allow_other: bool,
@@ -456,11 +475,17 @@ fn run_mount(
         tracing::warn!("RLIMIT_NOFILE is only {nofile}; xcheckfs needs two descriptors per cached inode");
     }
 
+    // Workers mostly wait in two file systems' syscalls: more than one per
+    // CPU. Each holds a request buffer of about 1 MiB.
+    let threads = a
+        .threads
+        .unwrap_or_else(|| (2 * std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).clamp(16, 64));
     let policy = Arc::new(Policy::new(a.on_mismatch, rules, rules_path.clone(), persist, sink.clone(), stats.clone())?);
     let cfg = EngineConfig {
         check: a.check,
         time_tolerance: a.time_tolerance,
         dir_nlink: !a.no_dir_nlink,
+        probe: !a.no_probe,
         parallel: !a.sequential,
         creds: !a.no_creds,
         mirror_locks: !a.no_lock_mirroring,
@@ -468,10 +493,12 @@ fn run_mount(
         attr_ttl: Duration::from_secs_f64(a.attr_timeout.max(0.0)),
         entry_ttl: Duration::from_secs_f64(a.entry_timeout.max(0.0)),
         direct_io: a.direct_io,
+        serialize: a.serialize,
+        lock_stripes: a.lock_stripes.clamp(16, 1 << 22),
+        secondary_threads: threads,
         quarantine: a.quarantine.clone(),
         quarantine_cap: a.quarantine_cap,
         resync_limit: a.resync_limit.max(1),
-        ..EngineConfig::default()
     };
     let engine = Arc::new(Engine::new(cfg.clone(), Arc::new(pb), Arc::new(sb), policy.clone(), stats.clone(), sink)?);
     Engine::spawn_lock_watchdog(&engine);
@@ -482,6 +509,8 @@ fn run_mount(
         "secondary": secondary.display().to_string(),
         "check": a.check.name(),
         "pid": std::process::id(),
+        "adaptations": engine.adaptations(),
+        "capability_gaps": engine.capability_gaps(),
     });
     let _ctl = control::serve(&socket_path, Arc::new(control::Shared { stats: stats.clone(), policy: policy.clone(), info }))?;
 
@@ -489,7 +518,6 @@ fn run_mount(
     let mut fcfg = fuser::Config::default();
     fcfg.mount_options = mount_options(a, &primary);
     fcfg.acl = if allow_other { fuser::SessionACL::All } else { fuser::SessionACL::Owner };
-    let threads = a.threads.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16));
     fcfg.n_threads = Some(threads.max(1));
     fcfg.clone_fd = threads > 1;
 

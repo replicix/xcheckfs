@@ -40,6 +40,10 @@ pub struct Node {
     pub ctimes: Mutex<Option<(Ts, Ts)>>,
     /// Mirrored POSIX record locks.
     pub locks: Mutex<LockState>,
+    /// Byte-range locks of data operations (relaxed serialization).
+    pub ranges: super::ranges::RangeLocks,
+    /// In-place data operations in flight (relaxed serialization).
+    pub data: super::ranges::DataInFlight,
 }
 
 impl Node {
@@ -68,6 +72,8 @@ impl Node {
             hint: Mutex::new(hint),
             ctimes: Mutex::new(None),
             locks: Mutex::new(LockState::default()),
+            ranges: Default::default(),
+            data: Default::default(),
         }
     }
 

@@ -17,9 +17,20 @@ use crate::events::UiEvent;
 
 /// `RUST_LOG` wins when set; otherwise xcheckfs logs at `level` and its
 /// dependencies at warn.
+///
+/// `fuser::reply` is silenced: fuser answers every FUSE_INTERRUPT (sent when
+/// an application blocked in the file system is signalled) with ENOSYS, and
+/// when the interrupted request has already completed, the normal case, the
+/// kernel rejects that reply with ENOENT and fuser logs "Failed to send FUSE
+/// reply" at error level. Processes that signal each other constantly (a
+/// database server's backends) produce thousands of these; none is
+/// actionable. `fuser::mnt` warns when its own cleanup unmounts a mount that
+/// is already gone (unmounted externally); xcheckfs logs unmount problems
+/// itself.
 fn filter(level: Level) -> EnvFilter {
-    EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("warn,xcheckfs={}", level.as_str().to_lowercase())))
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(format!("warn,fuser::reply=off,fuser::mnt=error,xcheckfs={}", level.as_str().to_lowercase()))
+    })
 }
 
 pub fn init_stderr(level: Level, color: bool) {

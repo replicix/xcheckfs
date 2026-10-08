@@ -39,6 +39,8 @@ use crate::sys::{self, Creds, CredsGuard, FileKind, Stat, SysResult};
 
 pub mod locks;
 pub mod node;
+pub mod probe;
+pub mod ranges;
 mod ops;
 mod resync;
 
@@ -114,6 +116,9 @@ pub(crate) struct Cx {
     /// Additional repair to queue with the next resyncable mismatch (the
     /// target name of a rename).
     pub(crate) resync_extra: Option<resync::ResyncReq>,
+    /// Data-operation state of a node from before a lookup's stat, for the
+    /// racy-stat rule of relaxed serialization.
+    pub(crate) stat_snap: Option<(u64, ranges::DataSnap)>,
     sec_errno: Option<i32>,
     mismatch: bool,
     bytes: u64,
@@ -250,6 +255,10 @@ pub struct Engine {
     fd_reserve: FdReserve,
     /// Shadow of granted record locks and blocked requests (deadlock detection).
     pub(crate) lock_graph: Mutex<locks::WaitGraph>,
+    /// How the engine adapts to legitimate differences of the two file systems (mount-time probe).
+    pub(crate) adapt: probe::Adapt,
+    adaptations: Vec<String>,
+    capability_gaps: Vec<String>,
 }
 
 impl Engine {
@@ -268,13 +277,38 @@ impl Engine {
         if pst.kind() != FileKind::Dir || sst.kind() != FileKind::Dir {
             anyhow::bail!("both roots must be directories");
         }
+        // How the two file systems behave where POSIX leaves them a choice (the probe touches the roots: stat
+        // them again afterwards).
+        let (pb, sb) = if cfg.probe {
+            (probe::probe(&*primary), probe::probe(&*secondary))
+        } else {
+            Default::default()
+        };
+        let (adapt, adaptations) = probe::Adapt::between(&pb, &sb);
+        let capability_gaps = probe::capability_gaps(&pb, &sb);
+        for a in &adaptations {
+            tracing::info!("{a}");
+        }
+        for g in &capability_gaps {
+            tracing::warn!("{g}");
+        }
+        let pst = primary.stat(std::os::fd::AsFd::as_fd(&pfd)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let sst = secondary.stat(std::os::fd::AsFd::as_fd(&sfd)).map_err(|e| anyhow::anyhow!("{e}"))?;
         let primary_root = sys::fd_path(std::os::fd::AsFd::as_fd(&pfd)).unwrap_or_default();
         let n = cfg.lock_stripes.max(16).next_power_of_two();
         let pool = if cfg.parallel {
             Some(
                 rayon::ThreadPoolBuilder::new()
                     .thread_name(|i| format!("xcheckfs-sec-{i}"))
-                    .num_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 32))
+                    // at least one per FUSE worker: a secondary half must never
+                    // queue behind other operations' halves
+                    .num_threads(
+                        std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(4)
+                            .max(cfg.secondary_threads)
+                            .clamp(2, 128),
+                    )
                     .build()?,
             )
         } else {
@@ -282,13 +316,19 @@ impl Engine {
         };
         let use_creds = cfg.creds && sys::is_root();
         // btrfs always reports a link count of 1 for directories: comparing
-        // directory link counts against it only produces noise.
-        let btrfs = [&pfd, &sfd].iter().any(|fd| sys::fs_magic(std::os::fd::AsFd::as_fd(*fd)) == Some(sys::BTRFS_MAGIC));
+        // directory link counts against it only produces noise. (The probe
+        // finds that out for any file system; this covers a root it could not
+        // write to.)
+        let btrfs = pb.dir_nlink.is_none()
+            && [&pfd, &sfd].iter().any(|fd| sys::fs_magic(std::os::fd::AsFd::as_fd(*fd)) == Some(sys::BTRFS_MAGIC));
         if btrfs && cfg.dir_nlink {
             tracing::info!("a btrfs side reports directory link counts as 1: not comparing them");
         }
-        let attr_rules =
-            AttrRules { time_tolerance: cfg.time_tolerance, dir_nlink: cfg.dir_nlink && !btrfs, mtime: true };
+        let attr_rules = AttrRules {
+            time_tolerance: cfg.time_tolerance,
+            dir_nlink: cfg.dir_nlink && !btrfs && !adapt.no_dir_nlink,
+            mtime: true,
+        };
         let root = Node::new(
             ROOT_ID,
             FileKind::Dir,
@@ -302,7 +342,8 @@ impl Engine {
         let root = match nodes.insert_or_get(Arc::new(root)) {
             node::Inserted::New(n) | node::Inserted::Existing(n) => n,
         };
-        *root.ctimes.lock() = Some((pst.ctime, sst.ctime));
+        // (after a probe, the roots' ctimes may still move: some file systems stamp them lazily)
+        *root.ctimes.lock() = if cfg.probe { None } else { Some((pst.ctime, sst.ctime)) };
         let e = Engine {
             cfg,
             b: [primary, secondary],
@@ -328,6 +369,9 @@ impl Engine {
             quarantine_seq: AtomicU64::new(0),
             fd_reserve: FdReserve::new(),
             lock_graph: Mutex::new(locks::WaitGraph::default()),
+            adapt,
+            adaptations,
+            capability_gaps,
         };
         e.stats.nodes.store(1, Relaxed);
         // Compare the roots once; differences are reported like any other.
@@ -345,6 +389,46 @@ impl Engine {
 
     pub fn primary(&self) -> &dyn Backend {
         &*self.b[0]
+    }
+
+    /// What the engine adapts to because the file systems legitimately differ (from the mount-time probe).
+    pub fn adaptations(&self) -> &[String] {
+        &self.adaptations
+    }
+
+    /// Optional operations only one of the file systems supports.
+    pub fn capability_gaps(&self) -> &[String] {
+        &self.capability_gaps
+    }
+
+    /// Sets the secondary's `mtime` of the directory `name` in `dir` to the primary's: after an operation that stamps it on one
+    /// of the file systems only, by a choice POSIX leaves to them (see `probe`). The node's ctime baseline is
+    /// reset (setting the time stamps the secondary's ctime).
+    pub(crate) fn align_mtime_at(&self, dir: &Node, name: &std::ffi::CStr) {
+        let Some(sd) = dir.try_s() else { return };
+        let Ok(pst) = self.b[0].stat_at(dir.p(), name) else { return };
+        if pst.kind() != FileKind::Dir {
+            return;
+        }
+        let Ok((sfd, sst)) = self.b[1].lookup(std::os::fd::AsFd::as_fd(&sd), name) else { return };
+        self.align_mtime(&pst, std::os::fd::AsFd::as_fd(&sfd), &sst);
+    }
+
+    /// The same for a node.
+    pub(crate) fn align_mtime_node(&self, n: &Node) {
+        let Some(sfd) = n.try_s() else { return };
+        let (Ok(pst), Ok(sst)) = (self.b[0].stat(n.p()), self.b[1].stat(std::os::fd::AsFd::as_fd(&sfd))) else { return };
+        self.align_mtime(&pst, std::os::fd::AsFd::as_fd(&sfd), &sst);
+    }
+
+    fn align_mtime(&self, pst: &sys::Stat, sfd: std::os::fd::BorrowedFd<'_>, sst: &sys::Stat) {
+        if pst.mtime != sst.mtime && pst.kind() == sst.kind() {
+            let _ = self.b[1].utimens(sfd, sst.kind(), None, crate::backend::TimeSpec::Omit, crate::backend::TimeSpec::Set(pst.mtime));
+            self.stats.aligned_mtimes.fetch_add(1, Relaxed);
+        }
+        if let Some(n) = self.nodes.get(self.map_ino(pst.ino)) {
+            *n.ctimes.lock() = None;
+        }
     }
 
     pub fn secondary(&self) -> &dyn Backend {
@@ -601,7 +685,7 @@ impl Engine {
     // ------------------------------------------------------------ reporting
 
     pub(crate) fn cx(&self, op: OpKind) -> Cx {
-        Cx { op, pns: 0, sns: 0, window_ns: 0, resync: Vec::new(), resync_extra: None, sec_errno: None, mismatch: false, bytes: 0 }
+        Cx { op, pns: 0, sns: 0, window_ns: 0, resync: Vec::new(), resync_extra: None, stat_snap: None, sec_errno: None, mismatch: false, bytes: 0 }
     }
 
     /// Current path of a node relative to the mount root.
@@ -760,10 +844,40 @@ impl Engine {
         excl: bool,
         what: &str,
     ) -> OpResult<()> {
+        self.cmp_stat_since(cx, node, p, s, excl, what, None)
+    }
+
+    /// Like [`Engine::cmp_stat`] for a stat taken under a shared lock in
+    /// relaxed mode: `snap` is the object's data-operation state from before
+    /// the stat. If an in-place data operation overlapped the stat, one file
+    /// system may already have stamped its mtime/ctime and the other not
+    /// yet: those two fields are then not compared, and the ctime baseline is
+    /// kept, so the next quiet stat still catches a file system that does
+    /// not update them. Everything else (type, mode, owner, size, link count)
+    /// cannot change under the shared lock and is compared as always.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cmp_stat_since(
+        &self,
+        cx: &mut Cx,
+        node: &Arc<Node>,
+        p: &Stat,
+        s: &Stat,
+        excl: bool,
+        what: &str,
+        snap: Option<ranges::DataSnap>,
+    ) -> OpResult<()> {
+        let racy = snap.is_some_and(|sn| node.data.overlapped(sn));
         let mut rules = self.attr_rules;
         rules.time_tolerance += Duration::from_nanos(cx.window_ns.max(self.slack_of(node.id)));
+        if racy {
+            rules.mtime = false;
+            self.stats.attr_time_skipped.fetch_add(1, Relaxed);
+        }
         for d in compare::diff_stat(p, s, &rules) {
             self.report(cx, node, MismatchKind::Attr, Some(d.field.into()), d.primary, d.secondary, what.into(), excl)?;
+        }
+        if racy {
+            return Ok(());
         }
         let prev = node.ctimes.lock().replace((p.ctime, s.ctime));
         // POSIX does not require a ctime update when the last link is removed (tmpfs does it, ZFS does not):
@@ -820,7 +934,7 @@ impl Engine {
         self.policy.gate();
         let t0 = Instant::now();
         let want_events = self.cfg.op_events && self.events.enabled();
-        let detail = if want_events { detail() } else { String::new() };
+        let detail = if want_events || tracing::enabled!(tracing::Level::TRACE) { detail() } else { String::new() };
         let inflight = want_events.then(|| self.stats.inflight.begin(op, ino, detail.clone()));
         let mut cx = self.cx(op);
         TOUCHED.with(|t| t.borrow_mut().clear());
@@ -851,6 +965,16 @@ impl Engine {
         if let Some(id) = inflight {
             self.stats.inflight.end(id);
         }
+        tracing::trace!(
+            op = op.name(),
+            ino,
+            errno,
+            sec = ?cx.sec_errno,
+            ns = total,
+            mismatch = cx.mismatch,
+            detail = %detail,
+            "op"
+        );
         if want_events {
             self.events.send(
                 UiEvent::Op(OpEvent {
@@ -869,15 +993,6 @@ impl Engine {
                 &self.stats,
             );
         }
-        tracing::trace!(
-            op = op.name(),
-            ino,
-            errno,
-            sec = ?cx.sec_errno,
-            ns = total,
-            mismatch = cx.mismatch,
-            "op"
-        );
         res
     }
 }

@@ -71,6 +71,9 @@ impl ResyncReq {
     }
 }
 
+/// (primary, secondary) descriptors of directories.
+type DirPairs = Vec<(OwnedFd, OwnedFd)>;
+
 /// State of one repair's copies: hard links made so far, and the
 /// (primary, secondary) directory searched for other names of hard links.
 struct CopyCtx<'a> {
@@ -153,7 +156,12 @@ impl Engine {
             // A directory's own state includes its entries (link count, size).
             // (unless the secondary object is not a directory at all: then the entry is replaced)
             ResyncReq::Object(n) if n.kind == FileKind::Dir && self.secondary_is_dir(n) => self.repair_entries(n, None, why),
-            ResyncReq::Object(n) => self.repair_object(n, &key, why),
+            ResyncReq::Object(n) => {
+                let mut dirs = Vec::new();
+                let r = self.repair_object(n, &key, why, &mut dirs);
+                self.restore_dir_times(dirs);
+                r
+            }
             ResyncReq::Entry(d, names) => self.repair_entries(d, Some(names.clone()), why),
             ResyncReq::Dir(d) => self.repair_entries(d, None, why),
         };
@@ -186,7 +194,10 @@ impl Engine {
         n.try_s().is_some_and(|fd| self.s().stat(fd.as_fd()).is_ok_and(|st| st.kind() == FileKind::Dir))
     }
 
-    fn repair_object(&self, n: &Arc<Node>, path: &str, why: &str) -> Result<(), String> {
+    /// `dirs` collects the directories whose names the repair changed on the secondary (their times then differ
+    /// from the primary's: [`Engine::restore_dir_times`] makes them equal again, after the object's lock is
+    /// released).
+    fn repair_object(&self, n: &Arc<Node>, path: &str, why: &str, dirs: &mut DirPairs) -> Result<(), String> {
         let _l = self.lock(&[(n.id, true)]);
         if !n.has_sec() {
             return Ok(());
@@ -200,12 +211,12 @@ impl Engine {
         if pst.kind() != sst.kind() || wrong_target {
             // Cannot be fixed in place: replace the directory entry.
             drop(sfd);
-            return self.repair_by_path(n, path, why);
+            return self.repair_by_path(n, path, why, dirs);
         }
         if pst.kind() != FileKind::Dir && pst.nlink != sst.nlink {
             // The link count is the symptom of a different hard-link structure: it cannot be fixed on the object,
             // only by making the names right.
-            if let Err(x) = self.repair_links(n, &pst, path, why) {
+            if let Err(x) = self.repair_links(n, &pst, path, why, dirs) {
                 tracing::warn!("{path}: cannot repair the hard links: {x}");
             }
             sfd = n.try_s().ok_or("the secondary object is gone")?;
@@ -225,7 +236,7 @@ impl Engine {
     /// Makes the names of the non-directory `n` (whose link count differs between the file systems) the same on
     /// both: every name the primary has for the inode (found by a bounded breadth-first walk of both trees from the
     /// root, in lockstep) must lead to one secondary inode, and no other secondary name may lead to it.
-    fn repair_links(&self, n: &Arc<Node>, pst: &Stat, path: &str, why: &str) -> Result<(), String> {
+    fn repair_links(&self, n: &Arc<Node>, pst: &Stat, path: &str, why: &str, changed: &mut DirPairs) -> Result<(), String> {
         const MAX_ENTRIES: usize = 20_000;
         let (p, s) = (self.p(), self.s());
         let root = self.nodes.get(super::ROOT_ID).ok_or("no root")?;
@@ -270,6 +281,7 @@ impl Engine {
         }
         let (tfd, tst) = target.ok_or("no secondary object to link the names to")?;
         let mut errors = Vec::new();
+        let mut touched = vec![false; dirs.len()];
         for (i, c) in &names {
             let (pd, sd) = &dirs[*i];
             let name = String::from_utf8_lossy(c.to_bytes()).into_owned();
@@ -282,6 +294,7 @@ impl Engine {
                 Ok(_) => {
                     // another object under this name: replace it
                     self.quarantine_at(sd.as_fd(), c, &format!("{}/{name}", self.path_of_dir(pd.as_fd())), why);
+                    touched[*i] = true;
                     if let Err(x) = s.unlink(sd.as_fd(), c) {
                         errors.push(e(&format!("unlink {name}"), x));
                         continue;
@@ -289,12 +302,13 @@ impl Engine {
                 }
                 Err(_) => {}
             }
+            touched[*i] = true;
             if let Err(x) = s.link(tfd.as_fd(), sd.as_fd(), c) {
                 errors.push(e(&format!("link {name}"), x));
             }
         }
         // names of the secondary inode that the primary does not have
-        for (pd, sd) in &dirs {
+        for (i, (pd, sd)) in dirs.iter().enumerate() {
             let Ok(list) = self.list(s, sd.as_fd()) else { continue };
             for ent in list.into_iter().filter(|x| x.ino == tst.ino && x.kind != Some(FileKind::Dir)) {
                 let Ok(c) = CString::new(ent.name) else { continue };
@@ -306,11 +320,13 @@ impl Engine {
                 }
                 let name = String::from_utf8_lossy(c.to_bytes()).into_owned();
                 self.quarantine_at(sd.as_fd(), &c, &format!("{}/{name}", self.path_of_dir(pd.as_fd())), why);
+                touched[i] = true;
                 if let Err(x) = s.unlink(sd.as_fd(), &c) {
                     errors.push(e(&format!("unlink {name}"), x));
                 }
             }
         }
+        changed.extend(dirs.into_iter().zip(touched).filter_map(|(d, t)| t.then_some(d)));
         if n.sident() != Some(tst.ident()) {
             self.nodes.set_secondary(n, Some((tfd, tst.ident())));
         }
@@ -332,7 +348,7 @@ impl Engine {
 
     /// Replaces the secondary entry of `n` found by its current path (for
     /// type and link-target differences, which cannot be repaired in place).
-    fn repair_by_path(&self, n: &Arc<Node>, path: &str, why: &str) -> Result<(), String> {
+    fn repair_by_path(&self, n: &Arc<Node>, path: &str, why: &str, dirs: &mut DirPairs) -> Result<(), String> {
         if path.ends_with(" (deleted)") {
             self.nodes.set_secondary(n, None);
             return Err("the object has no name on the primary any more".into());
@@ -353,13 +369,35 @@ impl Engine {
         let sdir = walk(self.s()).map_err(|x| e("secondary parent", x))?;
         let c = cname(name)?;
         let mut cc = CopyCtx { links: HashMap::new(), scope: (pdir.as_fd(), sdir.as_fd()) };
-        self.repair_entry(pdir.as_fd(), sdir.as_fd(), &c, path, why, &mut cc)?;
+        let res = self.repair_entry(pdir.as_fd(), sdir.as_fd(), &c, path, why, &mut cc);
+        drop(cc);
         match self.s().lookup(sdir.as_fd(), &c) {
             Ok((fd, st)) if st.kind() == n.kind => self.nodes.set_secondary(n, Some((fd, st.ident()))),
             _ => self.nodes.set_secondary(n, None),
         }
         *n.ctimes.lock() = None;
-        self.verify_entry(pdir.as_fd(), sdir.as_fd(), &c)
+        let res = res.and_then(|()| self.verify_entry(pdir.as_fd(), sdir.as_fd(), &c));
+        dirs.push((pdir, sdir));
+        res
+    }
+
+    /// Sets the times of each secondary directory in `dirs` (whose names a repair changed) to the primary's, under
+    /// the directory's lock when it is a known node: the change of names stamped the secondary's times only.
+    fn restore_dir_times(&self, mut dirs: DirPairs) {
+        let (p, s) = (self.p(), self.s());
+        let mut seen = std::collections::HashSet::new();
+        dirs.retain(|(pd, _)| p.stat(pd.as_fd()).is_ok_and(|st| seen.insert(st.ino)));
+        for (pd, sd) in dirs {
+            let Ok(pst) = p.stat(pd.as_fd()) else { continue };
+            let node = self.nodes.get(self.map_ino(pst.ino));
+            let _l = node.as_ref().map(|n| self.lock(&[(n.id, true)]));
+            // (again under the lock: an operation may have changed the directory meanwhile, on both sides)
+            let Ok(pst) = p.stat(pd.as_fd()) else { continue };
+            let _ = s.utimens(sd.as_fd(), FileKind::Dir, None, TimeSpec::Set(pst.atime), TimeSpec::Set(pst.mtime));
+            if let Some(n) = &node {
+                *n.ctimes.lock() = None;
+            }
+        }
     }
 
     // ------------------------------------------------------------ entries

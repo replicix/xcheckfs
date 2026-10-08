@@ -721,7 +721,8 @@ fn skipped_copy_file_range() {
         let (a, b) = (h.open("/f", libc::O_RDONLY), h.create("/g"));
         h.inject(Fault::new(FaultOp::CopyFileRange, Effect::Skip));
         let n = h.engine.copy_file_range(&h.ctx, a.fh, 0, b.fh, 0, 5000, 0).unwrap();
-        assert_eq!(n, 5000);
+        // (xfs and btrfs copy whole blocks per call: 4096 of the 5000)
+        assert!(n > 0 && n <= 5000, "{n}");
         let m = h.find_mismatch(K::Verify, Some("copied range"));
         assert_eq!(m.is_some(), immediate, "@{level:?}: {}", h.describe_mismatches());
         if !immediate {
@@ -737,7 +738,9 @@ fn skipped_copy_file_range() {
         let h = prepared(level);
         let (a, b) = (h.open("/f", libc::O_RDONLY), h.create("/g"));
         h.inject(Fault::new(FaultOp::CopyFileRange, Effect::ShortWrite(100)));
-        assert_eq!(h.engine.copy_file_range(&h.ctx, a.fh, 0, b.fh, 0, 5000, 0).unwrap(), 5000);
+        // (xfs and btrfs copy whole blocks per call: 4096 of the 5000)
+        let n = h.engine.copy_file_range(&h.ctx, a.fh, 0, b.fh, 0, 5000, 0).unwrap();
+        assert!(n > 0 && n <= 5000, "{n}");
         h.clear_faults();
         h.getattr("/g");
         h.assert_no_mismatches();
@@ -748,9 +751,9 @@ fn skipped_copy_file_range() {
     let (a, b) = (h.open("/f", libc::O_RDONLY), h.create("/g"));
     h.inject(Fault::new(FaultOp::CopyFileRange, Effect::ShortWrite(100)));
     h.inject(Fault::new(FaultOp::CopyFileRange, Effect::Errno(libc::EIO)).nth(2));
-    h.engine.copy_file_range(&h.ctx, a.fh, 0, b.fh, 0, 5000, 0).unwrap();
+    let n = h.engine.copy_file_range(&h.ctx, a.fh, 0, b.fh, 0, 5000, 0).unwrap();
     let m = h.expect_mismatch(K::Length, None);
-    assert_eq!((m.primary.as_str(), m.secondary.as_str()), ("5000", "100"));
+    assert_eq!((m.primary.as_str(), m.secondary.as_str()), (n.to_string().as_str(), "100"));
 }
 
 // ------------------------------------------------------------------------------------- lseek / delays

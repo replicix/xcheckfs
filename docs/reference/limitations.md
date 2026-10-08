@@ -11,6 +11,7 @@ in one place. Other pages link here instead of repeating it.
 - [Operations not mirrored](#operations-not-mirrored)
 - [Locking](#locking)
 - [Caching](#caching)
+- [Concurrency reaching the secondary](#concurrency-reaching-the-secondary)
 - [Not covered](#not-covered)
 - [Repair](#repair)
 - [Resources](#resources)
@@ -90,9 +91,38 @@ serves repeated reads from its page cache. Operations answered from those
 caches never reach xcheckfs and are **not re-checked**.
 
 For maximal coverage at a cost in speed, use
-`--attr-timeout 0 --entry-timeout 0 --direct-io`. `--direct-io` breaks shared
-writable `mmap` (a kernel restriction for FUSE direct I/O); do not use it for
-workloads that need it.
+`--attr-timeout 0 --entry-timeout 0 --direct-io all`. Direct I/O on every
+file needs kernel 6.7 or newer for shared writable `mmap` of those files;
+on older kernels it breaks it, so do not use `all` for workloads that need
+`mmap` there. The default, `--direct-io auto`, applies direct I/O only to
+files the application opens with `O_DIRECT`.
+
+## Concurrency reaching the secondary
+
+xcheckfs can only pass on the concurrency that reaches it
+([Design](../explanation/DESIGN.md#concurrent-data-operations)):
+
+- With the page cache (`--direct-io off`, and `auto` for files not opened
+  with `O_DIRECT`), the kernel serializes buffered writes to one file with
+  its inode lock before they reach FUSE, so the secondary sees one write to a
+  file at a time however parallel the application is. Reads are served from
+  the cache when they can be.
+- The kernel serializes directory mutations per directory (the VFS holds
+  the directory's lock); other operations in one directory run in parallel.
+- `--direct-io all` makes every read and write reach xcheckfs, and writes
+  that do not extend a file reach it concurrently.
+- Writes through a shared writable `mmap` reach xcheckfs through the
+  kernel's writeback, later and in larger pieces than the application's
+  stores, at times it does not control.
+- `FUSE_HANDLE_KILLPRIV_V2` is not enabled: the kernel itself clears the
+  set-uid and set-gid bits of a file written by an unprivileged user, and
+  xcheckfs sees that as a separate `setattr`. Writes to such files stay
+  exclusive. A write also removes a file's `security.capability` attribute;
+  a `getxattr` racing an in-place write to a file with file capabilities can
+  see it removed on one file system only and report a mismatch.
+- A stat that overlaps an in-place write does not compare `mtime` and `ctime`
+  ([Checks](checks.md#racy-stats)). `--serialize strict` removes both the
+  concurrency and this exception.
 
 ## Not covered
 

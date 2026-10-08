@@ -373,11 +373,16 @@ fn directories_and_large_listings() {
                 fs::remove_file(e.path()).unwrap();
             }
         }
-        // the directory's own link count follows its subdirectories
-        assert_eq!(fs::metadata(m.p("a")).unwrap().nlink(), 3);
+        // the directory's own link count is the primary's (2 + subdirectories, except on file systems such as
+        // btrfs that do not count them)
+        let nlink = |p: &str| (fs::metadata(m.p(p)).unwrap().nlink(), fs::metadata(m.h.p_path(p)).unwrap().nlink());
+        let (got, want) = nlink("a");
+        assert_eq!(got, want);
+        assert!(want == 3 || want == 1, "{want}");
         fs::remove_dir(m.p("a/b/c/d")).unwrap();
         fs::remove_dir(m.p("a/b/c")).unwrap();
-        assert_eq!(fs::metadata(m.p("a/b")).unwrap().nlink(), 2);
+        let (got, want) = nlink("a/b");
+        assert_eq!(got, want);
         m.finish();
     }
 }
@@ -1014,7 +1019,7 @@ fn parallel_hot_directory() {
 
 fn direct_io_mount(level: CheckLevel, mode: MismatchMode) -> Option<Mount> {
     // direct_io keeps reads away from the kernel page cache so every read reaches the engine
-    mount_with(Harness::builder().level(level).mode(mode).config(|c| c.direct_io = true))
+    mount_with(Harness::builder().level(level).mode(mode).config(|c| c.direct_io = xcheckfs::config::DirectIo::All))
 }
 
 #[test]
@@ -1139,7 +1144,7 @@ fn resync_repairs_a_diverged_secondary_through_the_mount() {
     let Some(m) = mount_seeded(
         // direct_io: every read reaches the engine (no page cache), so the second round below is seen too
         Harness::builder().mode(MismatchMode::Resync).config(|c| {
-            c.direct_io = true;
+            c.direct_io = xcheckfs::config::DirectIo::All;
             c.dir_nlink = false;
         }),
         |p, s| {
@@ -1315,4 +1320,321 @@ fn watchdog_self_test() {
     m.h.inject(Fault::new(FaultOp::Pread, Effect::CorruptRead { offset: 1 }).path("/victim"));
     let _ = fs::read(m.p("victim")); // freezes here, nobody can resolve it
     unreachable!("the watchdog should have killed this process");
+}
+
+// ------------------------------------------------------------------- relaxed serialization through the kernel
+
+mod relaxed_kernel {
+    use super::*;
+    use std::os::unix::fs::OpenOptionsExt;
+    use xcheckfs::backend::fault::{Effect, Fault, FaultOp, Gate, obj_of};
+
+    const BLOCK: usize = 16 << 10;
+    const FILE_BLOCKS: usize = 64;
+
+    /// A 4 KiB-aligned buffer (O_DIRECT) holding `blocks` blocks of pattern data.
+    pub struct Aligned {
+        v: Vec<u8>,
+        off: usize,
+        len: usize,
+    }
+
+    impl Aligned {
+        pub fn new(seed: u64, len: usize) -> Aligned {
+            let v = vec![0u8; len + 4096];
+            let off = v.as_ptr().align_offset(4096);
+            let mut a = Aligned { v, off, len };
+            a.as_mut().copy_from_slice(&data(seed, len));
+            a
+        }
+        pub fn as_ptr(&self) -> *const u8 {
+            self.v[self.off..].as_ptr()
+        }
+        pub fn as_mut(&mut self) -> &mut [u8] {
+            let (o, l) = (self.off, self.len);
+            &mut self.v[o..o + l]
+        }
+    }
+
+    /// Holds the secondary's pwrites to `/f` until two of them are in flight at once (or `give_up` passes: the
+    /// kernel then serializes them), then lets everything through; later pwrites take a couple of milliseconds so
+    /// that the processes keep overlapping. The thread returns whether two were seen together.
+    fn rendezvous(m: &Mount, give_up: Duration) -> std::thread::JoinHandle<bool> {
+        let g = Gate::new();
+        m.h.fault.add(Fault::new(FaultOp::Pwrite, Effect::Gate(g.clone())).path("/f"));
+        m.h.fault.add(Fault::new(FaultOp::Pwrite, Effect::Delay(Duration::from_millis(2))).path("/f"));
+        std::thread::spawn(move || {
+            let both = g.wait_arrived(2, give_up);
+            g.open();
+            both
+        })
+    }
+
+    fn prepare(m: &Mount) {
+        m.h.fault.record(true);
+        m.h.pfault.record(true);
+        // a preallocated file: the writes below do not extend it (the kernel serializes extending direct writes)
+        fs::write(m.p("f"), vec![0u8; FILE_BLOCKS * BLOCK]).unwrap();
+        File::open(m.p("f")).unwrap().sync_all().unwrap();
+    }
+
+    fn expected(blocks: &[usize], seed: u64) -> Vec<u8> {
+        let mut want = vec![0u8; FILE_BLOCKS * BLOCK];
+        for &b in blocks {
+            want[b * BLOCK..(b + 1) * BLOCK].copy_from_slice(&data(seed + b as u64, BLOCK));
+        }
+        want
+    }
+
+    /// Two processes, O_DIRECT pwrites of 16 KiB blocks to disjoint blocks of one file.
+    #[test]
+    fn two_processes_o_direct_writes_overlap_in_the_secondary() {
+        let _fork = fork_guard();
+        for level in [CheckLevel::Basic, CheckLevel::Thorough, CheckLevel::Paranoid] {
+            let m = mnt!(level, MismatchMode::Log);
+            prepare(&m);
+            let pairing = rendezvous(&m, Duration::from_secs(8));
+            let path = cpath(&m.p("f"));
+            // child c writes the blocks b with b % 2 == c, each from its own aligned buffer
+            let bufs: Vec<Vec<Aligned>> = (0..2)
+                .map(|c| (0..FILE_BLOCKS).filter(|b| b % 2 == c).map(|b| Aligned::new(100 + b as u64, BLOCK)).collect())
+                .collect();
+            let mut pids = Vec::new();
+            for (c, mine) in bufs.iter().enumerate() {
+                // SAFETY: the child only calls open, pwrite, close and _exit.
+                let pid = unsafe { libc::fork() };
+                if pid == 0 {
+                    // SAFETY: async-signal-safe calls only; the buffers were allocated before the fork.
+                    unsafe {
+                        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_DIRECT);
+                        if fd < 0 {
+                            libc::_exit(10);
+                        }
+                        for (i, buf) in mine.iter().enumerate() {
+                            let block = i * 2 + c;
+                            let n = libc::pwrite(fd, buf.as_ptr() as *const _, BLOCK, (block * BLOCK) as i64);
+                            if n != BLOCK as isize {
+                                libc::_exit(11);
+                            }
+                        }
+                        libc::_exit(if libc::close(fd) == 0 { 0 } else { 12 });
+                    }
+                }
+                assert!(pid > 0);
+                pids.push(pid);
+            }
+            for pid in pids {
+                assert_eq!(wait_child(pid, Duration::from_secs(60)), Some(0), "writer process failed ({level:?})");
+            }
+            let together = pairing.join().unwrap();
+            let max = m.h.fault.max_inflight(FaultOp::Pwrite, obj_of(&m.h.s_path("/f")));
+            let pmax = m.h.pfault.max_inflight(FaultOp::Pwrite, obj_of(&m.h.p_path("/f")));
+            eprintln!("{level:?}: two processes, O_DIRECT: secondary max pwrite in flight {max}, primary {pmax}, concurrent_data_ops {}", m.h.stats.concurrent_data_ops.load(Ordering::Relaxed));
+            let all: Vec<usize> = (0..FILE_BLOCKS).collect();
+            assert_eq!(fs::read(m.p("f")).unwrap(), expected(&all, 100), "{level:?}: content");
+            m.finish();
+            if !together {
+                eprintln!("SKIP: this kernel does not deliver parallel O_DIRECT writes to the daemon (FOPEN_PARALLEL_DIRECT_WRITES needs Linux 6.2+): max in flight {max}");
+                return;
+            }
+            assert!(max >= 2, "{level:?}: the secondary saw no concurrent pwrite (max {max})");
+            assert!(pmax >= 1);
+            assert!(m.h.stats.concurrent_data_ops.load(Ordering::Relaxed) > 0, "{level:?}: the engine saw no overlapping data operations");
+        }
+    }
+
+    // ---- io_submit
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Iocb {
+        data: u64,
+        key: u32,
+        rw_flags: i32,
+        opcode: u16,
+        reqprio: i16,
+        fildes: u32,
+        buf: u64,
+        nbytes: u64,
+        offset: i64,
+        reserved2: u64,
+        flags: u32,
+        resfd: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct IoEvent {
+        data: u64,
+        obj: u64,
+        res: i64,
+        res2: i64,
+    }
+
+    const IOCB_CMD_PWRITE: u16 = 1;
+
+    /// One io_submit with 8 O_DIRECT writes (kernel AIO): with FUSE_ASYNC_DIO the requests reach the daemon
+    /// together instead of one after the other.
+    #[test]
+    fn io_submit_o_direct_writes_overlap_in_the_secondary() {
+        for level in [CheckLevel::Basic, CheckLevel::Thorough] {
+            let m = mnt!(level, MismatchMode::Log);
+            prepare(&m);
+            let pairing = rendezvous(&m, Duration::from_secs(8));
+            let f = OpenOptions::new().write(true).custom_flags(libc::O_DIRECT).open(m.p("f")).unwrap();
+            let blocks = [0usize, 3, 5, 8, 13, 21, 34, 55];
+            let bufs: Vec<Aligned> = blocks.iter().map(|&b| Aligned::new(100 + b as u64, BLOCK)).collect();
+            let mut ctx: u64 = 0;
+            // SAFETY: io_setup with a valid out pointer.
+            let r = unsafe { libc::syscall(libc::SYS_io_setup, 16u32, &mut ctx as *mut u64) };
+            if r != 0 {
+                eprintln!("SKIP: io_setup: {}", std::io::Error::last_os_error());
+                return;
+            }
+            let mut cbs: Vec<Iocb> = blocks
+                .iter()
+                .zip(&bufs)
+                .map(|(&b, buf)| Iocb {
+                    opcode: IOCB_CMD_PWRITE,
+                    fildes: f.as_raw_fd() as u32,
+                    buf: buf.as_ptr() as u64,
+                    nbytes: BLOCK as u64,
+                    offset: (b * BLOCK) as i64,
+                    data: b as u64,
+                    ..Default::default()
+                })
+                .collect();
+            let mut ptrs: Vec<*mut Iocb> = cbs.iter_mut().map(|c| c as *mut Iocb).collect();
+            // SAFETY: valid context and iocb pointers; the buffers outlive the completion below.
+            let n = unsafe { libc::syscall(libc::SYS_io_submit, ctx, ptrs.len() as libc::c_long, ptrs.as_mut_ptr()) };
+            assert_eq!(n, blocks.len() as i64, "io_submit: {}", std::io::Error::last_os_error());
+            let mut events = vec![IoEvent::default(); blocks.len()];
+            let mut got = 0;
+            let t0 = std::time::Instant::now();
+            while got < blocks.len() {
+                assert!(t0.elapsed() < Duration::from_secs(60), "io_getevents: only {got} completions");
+                let mut ts = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+                // SAFETY: valid context, event buffer and timeout.
+                let k = unsafe { libc::syscall(libc::SYS_io_getevents, ctx, 1 as libc::c_long, (blocks.len() - got) as libc::c_long, events[got..].as_mut_ptr(), &mut ts as *mut libc::timespec) };
+                assert!(k >= 0, "io_getevents: {}", std::io::Error::last_os_error());
+                got += k as usize;
+            }
+            for e in &events {
+                assert_eq!(e.res, BLOCK as i64, "aio write of block {} failed: {}", e.data, e.res);
+            }
+            // SAFETY: valid context.
+            unsafe { libc::syscall(libc::SYS_io_destroy, ctx) };
+            drop(f);
+            let together = pairing.join().unwrap();
+            let max = m.h.fault.max_inflight(FaultOp::Pwrite, obj_of(&m.h.s_path("/f")));
+            eprintln!("{level:?}: io_submit of {} O_DIRECT writes: secondary max pwrite in flight {max}", blocks.len());
+            assert_eq!(fs::read(m.p("f")).unwrap(), expected(&blocks, 100), "{level:?}: content");
+            m.finish();
+            if !together {
+                eprintln!("SKIP: this kernel does not deliver the requests of one io_submit concurrently (max in flight {max})");
+                return;
+            }
+            assert!(max >= 2, "{level:?}: the secondary saw no concurrent pwrite (max {max})");
+        }
+    }
+
+    /// Buffered opens are untouched by `--direct-io auto`, and so is the page cache for them: a buffered
+    /// file and an O_DIRECT file side by side.
+    #[test]
+    fn buffered_and_direct_opens_work_side_by_side() {
+        for level in [CheckLevel::Basic, CheckLevel::Thorough, CheckLevel::Paranoid] {
+            let m = mnt!(level, MismatchMode::Log);
+            let big = data(3, 3_000_000);
+            fs::write(m.p("buffered"), &big).unwrap();
+            assert_eq!(fs::read(m.p("buffered")).unwrap(), big);
+            let mut f = OpenOptions::new().read(true).write(true).open(m.p("buffered")).unwrap();
+            f.seek(SeekFrom::Start(1000)).unwrap();
+            f.write_all(b"in the page cache").unwrap();
+            f.sync_all().unwrap();
+            // the same file through O_DIRECT sees it
+            let d = OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(m.p("buffered")).unwrap();
+            let mut buf = Aligned::new(0, 4096);
+            // SAFETY: valid fd, aligned buffer of 4096 bytes.
+            let n = unsafe { libc::pread(d.as_raw_fd(), buf.as_mut().as_mut_ptr() as *mut _, 4096, 0) };
+            assert_eq!(n, 4096);
+            assert_eq!(&buf.as_mut()[1000..1017], b"in the page cache");
+            drop(d);
+            drop(f);
+            // a direct-I/O-only file
+            let mut f = OpenOptions::new().read(true).write(true).create(true).custom_flags(libc::O_DIRECT).open(m.p("direct")).unwrap();
+            let a = Aligned::new(5, 8192);
+            f.write_all(unsafe { std::slice::from_raw_parts(a.as_ptr(), 8192) }).unwrap();
+            drop(f);
+            assert_eq!(fs::read(m.p("direct")).unwrap(), data(5, 8192));
+            m.finish();
+        }
+    }
+
+    /// A shared writable mapping of a file opened with O_DIRECT (FUSE_DIRECT_IO_ALLOW_MMAP, Linux 6.6+).
+    #[test]
+    fn mmap_of_an_o_direct_file_works() {
+        let _fork = fork_guard();
+        for level in [CheckLevel::Basic, CheckLevel::Thorough, CheckLevel::Paranoid] {
+            let m = mnt!(level, MismatchMode::Log);
+            let len = 1usize << 20;
+            let seed = data(8, len);
+            fs::write(m.p("mapped"), &seed).unwrap();
+            File::open(m.p("mapped")).unwrap().sync_all().unwrap();
+            let f = OpenOptions::new().read(true).write(true).custom_flags(libc::O_DIRECT).open(m.p("mapped")).unwrap();
+            let fd = f.as_raw_fd();
+            let new = data(9, 8192);
+            // SAFETY: the child only maps, reads, copies, syncs and exits.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // SAFETY: async-signal-safe calls only; accesses stay inside the mapping.
+                unsafe {
+                    let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+                    if p == libc::MAP_FAILED {
+                        let e = *libc::__errno_location();
+                        libc::_exit(if e == libc::ENODEV { 99 } else { 20 });
+                    }
+                    // reads see the file
+                    if libc::memcmp(p, seed.as_ptr() as *const _, 4096) != 0 {
+                        libc::_exit(21);
+                    }
+                    std::ptr::copy_nonoverlapping(new.as_ptr(), (p as *mut u8).add(100_000), new.len());
+                    if libc::msync(p, len, libc::MS_SYNC) != 0 {
+                        libc::_exit(22);
+                    }
+                    libc::_exit(if libc::munmap(p, len) == 0 { 0 } else { 23 });
+                }
+            }
+            assert!(pid > 0);
+            let code = wait_child(pid, Duration::from_secs(60));
+            if code == Some(99) {
+                eprintln!("SKIP: shared mmap of an O_DIRECT file needs FUSE_DIRECT_IO_ALLOW_MMAP (Linux 6.6+)");
+                return;
+            }
+            assert_eq!(code, Some(0), "mmap child failed ({level:?})");
+            drop(f);
+            let got = fs::read(m.p("mapped")).unwrap();
+            assert_eq!(&got[100_000..108_192], &new[..]);
+            assert_eq!(&got[..100_000], &seed[..100_000]);
+            assert_eq!(&got[108_192..], &seed[108_192..]);
+            m.finish();
+        }
+    }
+
+    /// What `init` negotiated: the background queue is 64 deep (fusectl shows it when it is readable).
+    #[test]
+    fn init_raises_max_background() {
+        let m = mnt!(CheckLevel::Basic, MismatchMode::Log);
+        // SAFETY: plain stat of the mount point.
+        let minor = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            libc::stat(cpath(&m.mnt).as_ptr(), &mut st);
+            libc::minor(st.st_dev)
+        };
+        match fs::read_to_string(format!("/sys/fs/fuse/connections/{minor}/max_background")) {
+            Ok(v) => assert_eq!(v.trim(), "64"),
+            Err(e) => eprintln!("SKIP: /sys/fs/fuse/connections/{minor}/max_background: {e}"),
+        }
+        fs::write(m.p("x"), b"x").unwrap();
+        m.finish();
+    }
 }

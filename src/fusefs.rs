@@ -16,6 +16,7 @@ use fuser::{
 };
 
 use crate::backend::{TimeSpec, XattrOut};
+use crate::config::DirectIo;
 use crate::engine::locks::{lock_end, lock_from_range};
 use crate::engine::{Attr, Ctx, Engine, SetAttr};
 use crate::stats::OpKind;
@@ -89,23 +90,44 @@ impl XcheckFs {
             Err(e) => reply.error(err(e)),
         }
     }
-    fn open_flags(&self) -> FopenFlags {
-        if self.engine.cfg.direct_io { FopenFlags::FOPEN_DIRECT_IO } else { FopenFlags::empty() }
+    /// Direct I/O per `--direct-io`; with it, parallel direct writes: the
+    /// kernel then sends non-extending writes to one file concurrently
+    /// (xcheckfs orders overlapping ones itself).
+    fn open_flags(&self, flags: i32) -> FopenFlags {
+        let direct = match self.engine.cfg.direct_io {
+            DirectIo::Off => false,
+            DirectIo::Auto => flags & libc::O_DIRECT != 0,
+            DirectIo::All => true,
+        };
+        if direct {
+            FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES
+        } else {
+            FopenFlags::empty()
+        }
     }
 }
 
 impl Filesystem for XcheckFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
-        let mut want = InitFlags::FUSE_PARALLEL_DIROPS;
+        // Parallel directory operations; asynchronous direct I/O (one
+        // io_submit's requests reach the file systems concurrently instead of
+        // one after another); shared mmap of direct-I/O files.
+        let mut want = vec![
+            InitFlags::FUSE_PARALLEL_DIROPS,
+            InitFlags::FUSE_ASYNC_DIO,
+            InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP,
+        ];
         if self.engine.cfg.mirror_locks {
-            want |= InitFlags::FUSE_POSIX_LOCKS;
+            want.push(InitFlags::FUSE_POSIX_LOCKS);
         }
-        for flag in [InitFlags::FUSE_PARALLEL_DIROPS, InitFlags::FUSE_POSIX_LOCKS] {
-            if want.contains(flag)
-                && let Err(missing) = config.add_capabilities(flag) {
-                    tracing::warn!("kernel does not support {missing:?}");
-                }
+        for flag in want {
+            if let Err(missing) = config.add_capabilities(flag) {
+                tracing::info!("kernel does not support {missing:?}");
+            }
         }
+        // More background requests (readahead, async direct I/O) in flight.
+        let _ = config.set_max_background(64);
+        let _ = config.set_congestion_threshold(48);
         let _ = config.set_max_write(1 << 20);
         let _ = config.set_time_granularity(Duration::from_nanos(1));
         Ok(())
@@ -201,7 +223,7 @@ impl Filesystem for XcheckFs {
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         match self.engine.open(&ctx(req), ino.0, flags.0) {
-            Ok(fh) => reply.opened(FileHandle(fh), self.open_flags()),
+            Ok(fh) => reply.opened(FileHandle(fh), self.open_flags(flags.0)),
             Err(e) => reply.error(err(e)),
         }
     }
@@ -350,7 +372,7 @@ impl Filesystem for XcheckFs {
         reply: ReplyCreate,
     ) {
         match self.engine.create(&ctx(req), parent.0, name, mode, flags) {
-            Ok((a, fh)) => reply.created(&self.attr_ttl(), &file_attr(&a), Generation(0), FileHandle(fh), self.open_flags()),
+            Ok((a, fh)) => reply.created(&self.attr_ttl(), &file_attr(&a), Generation(0), FileHandle(fh), self.open_flags(flags)),
             Err(e) => reply.error(err(e)),
         }
     }

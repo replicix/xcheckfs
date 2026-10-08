@@ -73,13 +73,17 @@ fn raw_utimes(path: &Path, atime: i64, mtime: i64) {
 }
 
 /// Flips every bit of the byte at `off` of a file, in place (same inode).
+/// Silent corruption: one byte changes, the times stay (a write would stamp mtime, which is a difference of its
+/// own once more than the time tolerance has passed since the file was written).
 fn flip_byte(path: &Path, off: u64) {
     use std::os::unix::fs::FileExt;
     let f = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let m = f.metadata().unwrap();
     let mut b = [0u8];
     f.read_exact_at(&mut b, off).unwrap();
     b[0] ^= 0xff;
     f.write_all_at(&b, off).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_accessed(m.accessed().unwrap()).set_modified(m.modified().unwrap())).unwrap();
 }
 
 /// Counters that the tests compare before and after a step.
@@ -692,6 +696,10 @@ fn entry_repair_of_one_name_is_no_failure_while_other_names_still_differ() {
         std::fs::create_dir(s.join("d/extra_dir1")).unwrap();
         std::fs::create_dir(s.join("d/extra_dir2")).unwrap();
     });
+    if h.engine.adaptations().iter().any(|a| a.contains("link count")) {
+        eprintln!("SKIP: directory link counts are not compared on these file systems (the test relies on them)");
+        return;
+    }
     // (the directory itself differs in its link count: that is repaired as a whole, before the names)
     let c0 = cnt(&h);
     assert_eq!(h.try_lookup("/d/missing1").unwrap().st.size, 1);
@@ -762,6 +770,45 @@ fn entry_hard_link_that_is_a_copy_on_the_secondary_is_relinked() {
         assert_eq!(nlink(&h.s_path("c")), 3);
         assert_eq!(c1.failures, 0);
     }
+}
+
+/// Repairs that change names in a directory on the secondary only (the hard links of an object, a symlink replaced
+/// by path) also restore the directory's times: its last real change can be long ago, far beyond the tolerance.
+#[test]
+fn repairs_of_names_restore_the_directory_times() {
+    let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    let age = |root: &Path| {
+        let f = std::fs::File::open(root.join("d")).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_accessed(old).set_modified(old)).unwrap();
+    };
+    let h = rs().build_with(|p, s| {
+        for r in [p, s] {
+            std::fs::create_dir(r.join("d")).unwrap();
+            write(r, "d/a", b"shared data");
+        }
+        std::fs::hard_link(p.join("d/a"), p.join("d/b")).unwrap();
+        write(s, "d/b", b"shared data"); // a copy where the primary has a link
+        symlink("t1", p.join("d/l")).unwrap();
+        symlink("t2", s.join("d/l")).unwrap();
+        age(p);
+        age(s);
+    });
+    let mtime = |root: &Path| std::fs::metadata(root.join("d")).unwrap().mtime();
+    h.lookup("/d");
+    let c0 = cnt(&h);
+    h.lookup("/d/a");
+    h.lookup("/d/b");
+    h.expect_mismatch(K::Attr, Some("nlink"));
+    let c1 = assert_repaired_once(&h, c0);
+    assert_eq!(mtime(h.s_root()), mtime(h.p_root()), "after the hard-link repair");
+    assert_eq!(h.readlink("/d/l").unwrap(), b"t1");
+    assert_repaired_once(&h, c1);
+    assert_eq!(mtime(h.s_root()), mtime(h.p_root()), "after the symlink repair");
+    h.assert_trees_equal();
+    let before = cnt(&h);
+    h.getattr("/d");
+    h.lookup("/d/a");
+    assert_quiet(&h, before);
 }
 
 #[test]

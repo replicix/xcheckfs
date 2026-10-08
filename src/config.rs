@@ -30,6 +30,33 @@ impl CheckLevel {
     }
 }
 
+/// How strictly operations on one object are serialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Serialization {
+    /// Every data operation holds its object exclusively (reads shared).
+    Strict,
+    /// In-place data operations on disjoint byte ranges of one file run
+    /// concurrently (and reach both file systems concurrently); anything
+    /// that changes the size or metadata stays exclusive.
+    Relaxed,
+}
+
+/// Which opened files use the kernel's direct-I/O path (no page cache).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum DirectIo {
+    /// None: the kernel page cache serves reads and serializes writes.
+    Off,
+    /// Files the application opens with O_DIRECT, with parallel direct
+    /// writes: concurrent in-place writes to one file reach xcheckfs (and
+    /// both file systems) concurrently.
+    Auto,
+    /// Every file (every read and write reaches xcheckfs; shared writable
+    /// mmap needs kernel 6.7+).
+    All,
+}
+
 /// What happens when the file systems disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -67,6 +94,8 @@ pub struct EngineConfig {
     pub time_tolerance: Duration,
     /// Compare directory link counts (some file systems always report 1).
     pub dir_nlink: bool,
+    /// Probe both file systems at mount time and adapt to their legitimate differences.
+    pub probe: bool,
     /// Run the two backends' halves of an operation concurrently.
     pub parallel: bool,
     /// Switch to the caller's fsuid/fsgid/groups for mutations. Only
@@ -78,9 +107,12 @@ pub struct EngineConfig {
     pub op_events: bool,
     pub attr_ttl: Duration,
     pub entry_ttl: Duration,
-    pub direct_io: bool,
+    pub direct_io: DirectIo,
     /// Number of lock stripes (rounded up to a power of two).
     pub lock_stripes: usize,
+    pub serialize: Serialization,
+    /// Threads running secondary halves (0: one per CPU).
+    pub secondary_threads: usize,
     /// Where secondary objects are copied before resync overwrites or
     /// removes them. `None`: report only.
     pub quarantine: Option<std::path::PathBuf>,
@@ -97,14 +129,17 @@ impl Default for EngineConfig {
             check: CheckLevel::Basic,
             time_tolerance: Duration::from_secs(1),
             dir_nlink: true,
+            probe: true,
             parallel: true,
             creds: true,
             mirror_locks: true,
             op_events: false,
             attr_ttl: Duration::from_secs(1),
             entry_ttl: Duration::from_secs(1),
-            direct_io: false,
-            lock_stripes: 4096,
+            direct_io: DirectIo::Auto,
+            lock_stripes: 65536,
+            serialize: Serialization::Relaxed,
+            secondary_threads: 0,
             quarantine: None,
             quarantine_cap: 64 << 20,
             resync_limit: 5,

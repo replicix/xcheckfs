@@ -64,7 +64,11 @@ pub struct Shared {
 }
 
 pub fn serve(path: &Path, shared: Arc<Shared>) -> anyhow::Result<ControlServer> {
-    if let Some(dir) = path.parent() {
+    // A directory xcheckfs creates is private (0700); an existing one (say
+    // /run) is left as it is.
+    if let Some(dir) = path.parent()
+        && !dir.exists()
+    {
         std::fs::create_dir_all(dir)?;
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
@@ -111,7 +115,11 @@ fn status(sh: &Shared) -> Value {
         "pending": sh.policy.pending().len(),
         "secondary_skipped": s.secondary_skipped,
         "verifications": s.verifications,
+        "concurrent_data_ops": s.concurrent_data_ops,
+        "range_waits": s.range_waits,
+        "attr_time_skipped": s.attr_time_skipped,
         "resyncs": s.resyncs,
+        "aligned_mtimes": s.aligned_mtimes,
         "resync_failures": s.resync_failures,
         "resync_giveups": s.resync_giveups,
         "quarantined": s.quarantined,

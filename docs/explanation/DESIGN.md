@@ -12,6 +12,8 @@ flags, formats and lists, and the ADRs record the alternatives rejected.
 - [Node ids](#node-ids)
 - [Lockstep execution](#lockstep-execution)
 - [What an operation does](#what-an-operation-does)
+- [Concurrent data operations](#concurrent-data-operations)
+- [Mount-time probe](#mount-time-probe)
 - [Credentials and permissions](#credentials-and-permissions)
 - [Directory listings](#directory-listings)
 - [Lock mirroring](#lock-mirroring)
@@ -88,8 +90,9 @@ one file system "between" the two halves. Without this, concurrent workloads
 would produce false positives (the two file systems legitimately end up in
 different orders), and a checker that cries wolf is useless.
 
-- **Stripe locks, not one global lock.** Locks are 4096 reader/writer locks
-  ("stripes") selected by a hash of the node id. Read-only operations share,
+- **Stripe locks, not one global lock.** Locks are reader/writer locks
+  ("stripes", 65536 by default, `--lock-stripes`) selected by a hash of the
+  node id. Read-only operations share,
   mutations are exclusive. Independent objects proceed in parallel, so the
   mirror does not serialize the workload ([ADR-3](DECISIONS.md#adr-3-stripe-locks-not-a-global-lock)).
 - **All at once, in stripe order.** An operation sorts the stripes it needs
@@ -133,6 +136,167 @@ Instead the engine remembers the last ctime pair of each node and reports a
 difference when one side's ctime moved while the other did not. This catches
 metadata changes made behind xcheckfs's back as well as operations that
 should have updated ctime but did not ([ADR-5](DECISIONS.md#adr-5-ctime-is-tracked-as-a-change-not-as-a-value)).
+
+## Concurrent data operations
+
+With `--serialize strict` every write holds its object's stripe exclusively,
+so one file never sees two writes at once on either file system. That is
+safe but hides exactly the bugs a busy application provokes: a database
+writing many pages of one file in parallel would reach the experimental file
+system one write at a time, and its concurrency defects would never show.
+`--serialize relaxed` (the default) keeps the comparison sound and lets
+non-overlapping data operations on one file run concurrently on both file
+systems
+([ADR-12](DECISIONS.md#adr-12-relaxed-serialization-byte-range-locks-for-in-place-data-operations)).
+
+**What runs concurrently.** Operations that change neither the file's size
+nor its metadata, *in place*:
+
+- `read`;
+- `write` that is not `O_APPEND` and ends within the primary's current size;
+- `fallocate` with `FALLOC_FL_KEEP_SIZE` (which `PUNCH_HOLE` implies), or
+  whose range ends within the size, except `COLLAPSE_RANGE` and
+  `INSERT_RANGE`;
+- `copy_file_range`, when the destination range ends within the size and, for
+  a copy within one file, source and destination do not overlap;
+- `lseek` with `SEEK_DATA` or `SEEK_HOLE` and the close-time content
+  comparison of `paranoid`, which hold the whole file as a shared range.
+
+Such an operation takes the object's stripe **shared**, then a **byte-range
+lock**: exclusive for a writer, shared for a reader. The size cannot change
+under a shared stripe (only exclusive holders change it), which is what makes
+"within the size" a stable test. The range table of an object is
+first-come-first-served: a request waits for every earlier conflicting one,
+held or queued, so a stream of readers cannot starve a writer. An operation
+that needs several ranges (`copy_file_range`) asks for them as one request.
+All stripes are taken before any range, and ranges in node id order, so
+waits cannot form a cycle.
+
+**What stays exclusive.** Everything else: `O_APPEND` writes, writes that
+extend the file, `truncate` and the other `setattr` steps, `fallocate` that
+extends the file or uses `COLLAPSE_RANGE` or `INSERT_RANGE`, a
+`copy_file_range` that extends its destination or copies within one file with
+overlapping ranges, and any write, size-bound `fallocate` or `copy_file_range`
+destination on a file with set-uid or set-gid bits (an unprivileged write
+clears them, a mode change a concurrent `getattr` could see on one file
+system only). The operation is first looked at under the
+shared stripe; if it does not qualify, the shared stripe is released and the
+exclusive one taken.
+
+**Why the comparison stays sound.** Both halves of an operation run while
+the operation holds its range, so two operations with overlapping ranges
+(one of them a writer) are ordered by the range lock and execute in that
+order on both file systems. Writes to disjoint ranges commute on every POSIX
+file system, so it does not matter that the two sides interleave them
+differently. Without the range lock, overlapping writes could be applied in
+different orders on the two sides and leave different bytes behind: a false
+mismatch, and in `resync` mode a repair of an innocent secondary.
+
+**Racy stats.** A stat taken while in-place writes are in flight can see one
+file system's `mtime` and `ctime` already updated by a write and the other's
+not yet, or the two sides reflecting different subsets of several concurrent
+writes. Each object counts its writing data operations in flight, with a
+sequence number that changes on every start. A `getattr`, a `lookup`, and the
+stat after a `fallocate` note the object's state before the stat; if an in-place write was in
+flight at that point, started, or finished meanwhile, the stat *overlapped*
+one. For such a stat `mtime` and `ctime` are not compared, and the ctime
+baseline ([ctime tracking](#what-an-operation-does)) is left unchanged, so the
+next quiet stat still catches a file system that never updates ctime. Size,
+type, mode, owner and link count cannot change under a shared stripe and are
+compared as always. Skipped comparisons are counted (`attr_time_skipped`). At
+`thorough`, each in-place write additionally checks that both sides' `mtime`
+is not older than the moment the write started (minus `--time-tolerance`, at least 50 ms):
+this "write mtime" check still catches a file system that does not stamp
+`mtime` at all ([Checks](../reference/checks.md#racy-stats)).
+
+**What the kernel serializes by itself.** The mirror can only see what
+reaches it. Buffered writes to one file are serialized by the kernel's inode
+lock before they reach FUSE, so with the page cache a file sees one write at
+a time; directory mutations are serialized by the VFS per directory. To
+let more reach xcheckfs, the mount requests:
+
+- `FUSE_PARALLEL_DIROPS`: lookups and other operations in one directory in
+  parallel;
+- `FUSE_ASYNC_DIO`: the requests of one asynchronous direct I/O submission
+  reach the file systems together instead of one after another;
+- `FUSE_DIRECT_IO_ALLOW_MMAP`: shared `mmap` of files opened with direct I/O
+  (kernel 6.7 or newer);
+- a larger background queue (`max_background` 64, congestion threshold 48),
+  so readahead and asynchronous direct I/O keep many requests in flight;
+- per file, with `--direct-io auto` (the default) for files opened with
+  `O_DIRECT`, and with `all` for every file, direct I/O with
+  `FOPEN_PARALLEL_DIRECT_WRITES`: the kernel then sends writes that do not
+  extend the file to xcheckfs concurrently instead of holding the inode lock.
+
+`FUSE_HANDLE_KILLPRIV_V2` is deliberately not requested. With it the file
+system, not the kernel, would have to clear set-uid and set-gid bits on
+write, and the mirror would have to apply and compare that on both sides;
+that is deferred. Writable mmap pages reach xcheckfs through the kernel's
+writeback, at times the application does not control
+([Limitations](../reference/limitations.md#caching)).
+
+The workers keep up with this: the FUSE pool is larger than the CPU count
+(see [Processes and threads](#processes-and-threads)), and the pool that runs
+the secondary halves is at least as large, so a secondary half never queues
+behind other operations' halves.
+
+## Mount-time probe
+
+POSIX leaves a few choices to the file system, and two correct file systems
+choose differently: whether a directory's link count counts its
+subdirectories, whether moving a directory to another parent stamps the
+directory's own `mtime`, whether `RENAME_EXCHANGE` of directories in
+different parents does, whether a truncate to the size a file already has
+stamps `mtime` (by path and through a descriptor), and whether punching a
+hole into a range without data does. Reporting these would bury the
+mismatches that matter; the measured differences are in
+[Known differences](../reference/fs-differences.md).
+
+**Probe, not a table.** At mount (unless `--no-probe`) the engine runs a few
+operations in a scratch directory `.xcheckfs-probe-<pid>-<hex>` at the root
+of each tree, through the same backend calls it uses for real operations,
+and records what each file system did. It then removes the directory and
+puts the root's atime and mtime back. The experimental file system has no
+known type to look up, and a table keyed by file system type goes stale; a
+probe covers whatever is mounted
+([ADR-13](DECISIONS.md#adr-13-adapt-to-legitimate-file-system-differences-found-by-a-mount-time-probe)).
+If a root is not writable the probe learns nothing and nothing is adapted.
+
+**What is adapted to, and what is not.** Only choices POSIX allows:
+
+- directory link counts are not compared if either side does not count
+  subdirectories;
+- for the mtime choices, the engine acts only when the primary and the
+  secondary differ. Right after the operation, and only in the situation
+  that differs (a directory moved or exchanged across parents; a truncate
+  whose size equals the primary's size before and that sets no `mtime`
+  itself, by path or by descriptor as probed; a hole punched into a range
+  that held no data on the primary), it sets the secondary's `mtime` to the
+  primary's with `utimens`. That moves the secondary's ctime, so the node's
+  ctime baseline is reset ([ctime](#what-an-operation-does)). A punch hole
+  that may be aligned takes the file exclusively under relaxed serialization,
+  so a concurrent write cannot stamp `mtime` between the punch and the
+  alignment. Each alignment counts in `aligned_mtimes`.
+
+Optional operations that only one side supports (`fallocate` modes) are not
+adapted to: an experimental file system that lacks one should be noticed. The
+mount logs each at warn level with the allow rule that accepts the resulting
+`result` mismatches, and lists them under `info.capability_gaps`; adaptations
+are logged at info level and listed under `info.adaptations`
+([Control protocol](../reference/control-protocol.md#status)).
+
+**Why the alignment is so narrow.** It applies only to the exact operation
+and situation where file systems are known to differ, so a secondary that
+never stamps `mtime` is still caught: a size-changing truncate, a hole
+punched into data, a write, and a rename within one parent all stay
+compared. Aligning broadly (say, skipping the `mtime` comparison for a node
+until its next change) would hide those defects.
+
+**Cost.** The probe creates and removes files in each root (the roots' ctime
+changes), and the secondary's `mtime` is modified by xcheckfs where aligned.
+
+When the probe could not run, a btrfs side (by file system type) still
+switches off directory link-count comparison, as before the probe existed.
 
 ## Credentials and permissions
 
@@ -341,7 +505,10 @@ unmount and mount again to resume.
 ## Processes and threads
 
 - FUSE requests are served by a pool of worker threads (`--threads`, default
-  the number of CPUs, at most 16).
+  twice the number of CPUs, between 16 and 64: workers mostly wait in two
+  file systems' system calls). The secondary halves of operations run on a
+  second pool, at least as large as the FUSE pool and the CPU count (at
+  most 128).
 - `RLIMIT_NOFILE` is raised to the hard limit: each cached inode holds two
   `O_PATH` descriptors.
 - `SIGINT`, `SIGTERM` and `SIGHUP` release frozen operations and unmount

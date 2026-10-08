@@ -48,7 +48,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config as PtConfig, FileFailurePersistence, TestCaseError};
 use xcheckfs::backend::TimeSpec;
 use xcheckfs::backend::fault::{Effect, Fault, FaultOp, StatLie, Trigger};
-use xcheckfs::config::{CheckLevel, MismatchMode};
+use xcheckfs::config::{CheckLevel, MismatchMode, Serialization};
 use xcheckfs::engine::SetAttr;
 use xcheckfs::sys::{FileKind, Ts};
 
@@ -635,11 +635,22 @@ impl Drop for Env {
 /// A fresh harness with `/d0` and `/d1` in place. `parallel`: the two halves of an operation run concurrently
 /// (the default of the engine; the sequential variant is cheaper for the tests that run hundreds of harnesses).
 fn harness(level: CheckLevel, mode: MismatchMode, parallel: bool) -> Env {
+    harness_ser(level, mode, parallel, Serialization::Relaxed)
+}
+
+fn harness_ser(level: CheckLevel, mode: MismatchMode, parallel: bool, ser: Serialization) -> Env {
     // `XCHECKFS_TEST_LOG=warn cargo test --test engine_proptest -- --nocapture` shows the engine's log
     if let Ok(f) = std::env::var("XCHECKFS_TEST_LOG") {
         let _ = tracing_subscriber::fmt().with_env_filter(f).with_test_writer().try_init();
     }
-    let h = Harness::builder().level(level).mode(mode).config(move |c| c.parallel = parallel).build();
+    let h = Harness::builder()
+        .level(level)
+        .mode(mode)
+        .config(move |c| {
+            c.parallel = parallel;
+            c.serialize = ser;
+        })
+        .build();
     h.mkdir("/d0");
     h.mkdir("/d1");
     Env(h)
@@ -752,8 +763,8 @@ fn check_healthy(ops: &[Op]) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-fn check_healthy_concurrent(lanes: &[Vec<Op>], level: CheckLevel) -> Result<(), TestCaseError> {
-    let h = harness(level, MismatchMode::Log, true);
+fn check_healthy_concurrent(lanes: &[Vec<Op>], level: CheckLevel, ser: Serialization) -> Result<(), TestCaseError> {
+    let h = harness_ser(level, MismatchMode::Log, true, ser);
     let barrier = Barrier::new(lanes.len());
     std::thread::scope(|s| {
         for lane in lanes {
@@ -1411,7 +1422,10 @@ proptest! {
     /// 2-4 threads, each with its own sequence and its own open files, on one engine.
     #[test]
     fn no_false_positives_concurrent(lanes in lanes_s(), level in level_s()) {
-        check_healthy_concurrent(&lanes, level)?;
+        // (every case runs under both serializations)
+        for ser in [Serialization::Strict, Serialization::Relaxed] {
+            check_healthy_concurrent(&lanes, level, ser)?;
+        }
     }
 }
 

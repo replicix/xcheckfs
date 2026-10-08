@@ -50,13 +50,16 @@ inside a tree is accepted with a warning, and new rules are not saved to it
 | `--resync-limit N` | `5` | Repairs of one path within 10 minutes before resync gives up on it ([Design](../explanation/DESIGN.md#repair-limits-and-failures)). At least 1. |
 | `--rules FILE` | `/etc/xcheckfs/rules.toml` as root, else `$XDG_CONFIG_HOME/xcheckfs/rules.toml` (`~/.config/...`) | Allow-rules file ([Rules](rules.md)). A missing file means no rules. |
 | `--time-tolerance DUR` | `1s` | Allowed mtime difference, and minimum ctime movement that must be matched by the other side. Accepts `s`, `ms`, `us`, `ns` suffixes (e.g. `500ms`). |
-| `--no-dir-nlink` | off | Do not compare link counts of directories (some file systems always report 1). |
+| `--no-dir-nlink` | off | Do not compare link counts of directories (some file systems always report 1). The [mount-time probe](fs-differences.md#the-mount-time-probe) finds such a file system by itself. |
+| `--no-probe` | off | Do not probe the file systems at mount time. The probe runs a few operations in a scratch directory at the root of each tree (removed again; the roots' times are restored, their ctime changes) to find where the two file systems legitimately differ, which is then adapted to instead of reported, and which optional operations only one of them supports, which is logged ([Known differences](fs-differences.md#the-mount-time-probe)). |
 
 ### Execution
 
 | Flag | Default | Description |
 |---|---|---|
-| `--threads N` | CPUs, at most 16 | FUSE worker threads. |
+| `--threads N` | 2 × CPUs, at least 16, at most 64 | FUSE worker threads. Workers mostly wait in two file systems' system calls, hence more than one per CPU; each holds a request buffer of about 1 MiB. The pool that runs the secondary halves is at least this large. |
+| `--serialize relaxed\|strict` | `relaxed` | How strictly operations on one object are serialized. `relaxed`: in-place reads and writes on disjoint byte ranges of one file run concurrently, on both file systems; anything that changes the size or metadata stays exclusive ([Design](../explanation/DESIGN.md#concurrent-data-operations)). `strict`: every write holds its object exclusively. |
+| `--lock-stripes N` | `65536` | Number of lock stripes ([Design](../explanation/DESIGN.md#lockstep-execution)). Clamped to 16 to 4194304 and rounded up to a power of two. Objects that hash to one stripe serialize each other's exclusive operations. |
 | `--sequential` | off | Run the secondary half after the primary instead of concurrently. |
 | `--no-creds` | off | Do not switch to the caller's credentials for mutations (only effective as root; [Design](../explanation/DESIGN.md#credentials-and-permissions)). |
 | `--no-lock-mirroring` | off | Let the kernel handle `fcntl` locks locally ([Design](../explanation/DESIGN.md#lock-mirroring)). |
@@ -67,7 +70,7 @@ inside a tree is accepted with a warning, and new rules are not saved to it
 |---|---|---|
 | `--attr-timeout SECS` | `1.0` | Kernel attribute cache timeout. `0` means every `stat` reaches xcheckfs. |
 | `--entry-timeout SECS` | `1.0` | Kernel dentry cache timeout. `0` means every lookup reaches xcheckfs. |
-| `--direct-io` | off | Bypass the kernel page cache so every read and write reaches xcheckfs. Breaks shared writable `mmap` ([Limitations](limitations.md#caching)). |
+| `--direct-io [off\|auto\|all]` | `auto` | Which opened files use the kernel's direct-I/O path (no page cache). `off`: none; the page cache serves reads and the kernel serializes writes per inode. `auto`: files the application opens with `O_DIRECT` get direct I/O with parallel direct writes, so concurrent writes to one file reach xcheckfs concurrently. `all`: every open bypasses the page cache, so every read and write reaches xcheckfs (shared writable `mmap` of such files needs kernel 6.7 or newer). `--direct-io` without a value means `all`. See [Limitations](limitations.md#caching). |
 | `--allow-other` | on as root, else off | Let other users access the mount. As non-root, `fusermount3` additionally requires `user_allow_other` in `/etc/fuse.conf`. |
 | `-o OPTS` | | Extra comma-separated mount options, e.g. `-o suid,dev`. Known: `dev nodev suid nosuid ro rw exec noexec atime noatime sync async dirsync auto_unmount`; anything else is passed through. `default_permissions`, `fsname=xcheckfs:PRIMARY` and `subtype=xcheckfs` are always set. |
 
@@ -86,7 +89,10 @@ the first mount and after the last unmount. Compares attributes (as in
 [Checks](checks.md#attributes)), symlink targets, xattrs, file content, and
 hard-link structure; names present on one side only are reported and not
 descended into. Symlinks are never followed; directories on another file
-system than the root are not entered.
+system than the root are not entered. Directory link counts are not compared
+when either root reports a link count of 1 (a file system that does not
+count subdirectories, such as btrfs), and SELinux labels
+(`security.selinux`) never are: the policy assigns them per mount.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -153,6 +159,9 @@ If the mount is busy because operations are frozen, release them first:
 | otherwise | stderr, colored when it is a terminal and `--no-color` is not set |
 
 `RUST_LOG`, when set, replaces the built-in filter (which is
-`warn,xcheckfs=LEVEL`). A mismatch is one log line at error level starting
+`warn,fuser::reply=off,fuser::mnt=error,xcheckfs=LEVEL`: the FUSE library's
+failed replies to `FUSE_INTERRUPT` for requests that already completed, which
+signal-heavy applications cause by the thousand, and its warnings about an
+already-gone mount at unmount are not logged). A mismatch is one log line at error level starting
 with `MISMATCH #ID`, naming the operation, kind, field, path, inode and both
 values.

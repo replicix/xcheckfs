@@ -12,18 +12,23 @@
 //! fb.clear();
 //! ```
 //!
+//! Two more tools for concurrency tests: an in-flight recorder ([`FaultBackend::record`]: per method and object,
+//! how many calls were running at once) and [`Effect::Gate`] (a call blocks until the test opens a [`Gate`]),
+//! which together prove that, and force how, the halves of engine operations interleave.
+//!
 //! Effects only make sense for some methods (a `ShortRead` on `unlink` is
 //! meaningless); an effect that does not apply to the method it fires on is
 //! ignored. Faults are evaluated in the order they were added and all firing
 //! faults apply (so `Delay` can be combined with another effect).
 
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use super::{Backend, DirEntry, Lock, StatFs, TimeSpec, XattrOut};
 use crate::sys::{self, FileKind, Stat, SysResult, Ts};
@@ -127,6 +132,204 @@ impl std::fmt::Debug for StatLie {
     }
 }
 
+
+/// A latch that holds the calls it is attached to ([`Effect::Gate`]) until the test opens it. Event-driven: the
+/// test waits for calls to *arrive* ([`Gate::wait_arrived`]) and for released calls to *finish*
+/// ([`Gate::wait_done`]), so interleavings of the two halves of engine operations can be forced without sleeping.
+/// A call never waits longer than `timeout` (30 s by default): it then proceeds and [`Gate::timed_out`] says so, so
+/// that a broken test fails instead of hanging.
+pub struct Gate {
+    st: Mutex<GateState>,
+    cv: Condvar,
+    timeout: Duration,
+}
+
+#[derive(Default)]
+struct GateState {
+    open: bool,
+    /// Calls that reached the gate (blocked or not).
+    arrived: u64,
+    /// Calls that were let through and have finished the call to the inner backend.
+    done: u64,
+    timed_out: bool,
+}
+
+impl Gate {
+    /// A closed gate.
+    pub fn new() -> Arc<Gate> {
+        Gate::with_timeout(Duration::from_secs(30))
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Arc<Gate> {
+        Arc::new(Gate { st: Mutex::new(GateState::default()), cv: Condvar::new(), timeout })
+    }
+
+    /// Lets every waiting and every future call through.
+    pub fn open(&self) {
+        self.st.lock().open = true;
+        self.cv.notify_all();
+    }
+
+    pub fn close(&self) {
+        self.st.lock().open = false;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.st.lock().open
+    }
+
+    pub fn arrived(&self) -> u64 {
+        self.st.lock().arrived
+    }
+
+    pub fn done(&self) -> u64 {
+        self.st.lock().done
+    }
+
+    /// Whether any call gave up waiting for the gate.
+    pub fn timed_out(&self) -> bool {
+        self.st.lock().timed_out
+    }
+
+    /// Waits until `n` calls have arrived; false on timeout.
+    pub fn wait_arrived(&self, n: u64, timeout: Duration) -> bool {
+        self.wait_for(timeout, |s| s.arrived >= n)
+    }
+
+    /// Waits until `n` calls have been let through and finished; false on timeout.
+    pub fn wait_done(&self, n: u64, timeout: Duration) -> bool {
+        self.wait_for(timeout, |s| s.done >= n)
+    }
+
+    fn wait_for(&self, timeout: Duration, cond: impl Fn(&GateState) -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut st = self.st.lock();
+        while !cond(&st) {
+            if self.cv.wait_until(&mut st, deadline).timed_out() {
+                return cond(&st);
+            }
+        }
+        true
+    }
+
+    fn pass(self: &Arc<Gate>) -> GateTicket {
+        let mut st = self.st.lock();
+        st.arrived += 1;
+        self.cv.notify_all();
+        let deadline = Instant::now() + self.timeout;
+        while !st.open {
+            if self.cv.wait_until(&mut st, deadline).timed_out() {
+                st.timed_out = true;
+                break;
+            }
+        }
+        GateTicket(self.clone())
+    }
+}
+
+/// Counts the call as finished when dropped.
+struct GateTicket(Arc<Gate>);
+
+impl Drop for GateTicket {
+    fn drop(&mut self) {
+        self.0.st.lock().done += 1;
+        self.0.cv.notify_all();
+    }
+}
+
+impl std::fmt::Debug for Gate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let st = self.st.lock();
+        write!(f, "Gate(open={}, arrived={}, done={})", st.open, st.arrived, st.done)
+    }
+}
+
+/// Identity of a file system object: `(st_dev, st_ino)`.
+pub type ObjId = (u64, u64);
+
+/// `(st_dev, st_ino)` of a path (following symlinks), to name the object to [`FaultBackend::max_inflight`].
+pub fn obj_of(path: &std::path::Path) -> ObjId {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path).unwrap_or_else(|e| panic!("obj_of {}: {e}", path.display()));
+    (md.dev(), md.ino())
+}
+
+#[derive(Default, Clone, Copy)]
+struct Level {
+    cur: u32,
+    max: u32,
+    total: u64,
+}
+
+impl Level {
+    fn enter(&mut self) {
+        self.cur += 1;
+        self.total += 1;
+        self.max = self.max.max(self.cur);
+    }
+}
+
+/// Calls in flight, per method and object (and per method over all objects).
+#[derive(Default)]
+struct Recorder {
+    on: AtomicBool,
+    st: Mutex<RecState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct RecState {
+    by_obj: HashMap<(FaultOp, ObjId), Level>,
+    by_op: HashMap<FaultOp, Level>,
+}
+
+/// Leaves the in-flight record when dropped.
+struct RecGuard<'a> {
+    rec: &'a Recorder,
+    op: FaultOp,
+    objs: Vec<ObjId>,
+}
+
+impl Drop for RecGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self.rec.st.lock();
+        for o in &self.objs {
+            if let Some(l) = st.by_obj.get_mut(&(self.op, *o)) {
+                l.cur -= 1;
+            }
+        }
+        if let Some(l) = st.by_op.get_mut(&self.op) {
+            l.cur -= 1;
+        }
+        self.rec.cv.notify_all();
+    }
+}
+
+impl Recorder {
+    /// Enters `op` on the objects behind `fds`: counted once for the method and once for every distinct object.
+    fn enter(&self, inner: &dyn Backend, op: FaultOp, fds: &[BorrowedFd<'_>]) -> Option<RecGuard<'_>> {
+        if !self.on.load(Relaxed) {
+            return None;
+        }
+        let mut objs: Vec<ObjId> = Vec::new();
+        for fd in fds {
+            if let Ok(st) = inner.stat(*fd) {
+                let o = (st.dev, st.ino);
+                if !objs.contains(&o) {
+                    objs.push(o);
+                }
+            }
+        }
+        let mut st = self.st.lock();
+        for o in &objs {
+            st.by_obj.entry((op, *o)).or_default().enter();
+        }
+        st.by_op.entry(op).or_default().enter();
+        self.cv.notify_all();
+        Some(RecGuard { rec: self, op, objs })
+    }
+}
+
 /// What a firing fault does.
 #[derive(Clone, Debug)]
 pub enum Effect {
@@ -141,6 +344,9 @@ pub enum Effect {
     Skip,
     /// Sleep this long before executing the operation.
     Delay(Duration),
+    /// Hold the call (before it does anything, but after it was counted as in flight) until the test opens the
+    /// [`Gate`]; combine with a [`Trigger`] to hold only some calls.
+    Gate(Arc<Gate>),
 
     // ---- data
     /// pread: flip all bits of the returned byte at `offset` (if within the returned data).
@@ -153,6 +359,17 @@ pub enum Effect {
     DropWrite,
     /// pwrite: flip all bits of the byte at `offset` of the data before writing it, report success.
     CorruptWrite { offset: usize },
+    /// pwrite: write the data `k` bytes further on (or earlier, when negative) than asked, report success for the
+    /// asked offset (a file system that mishandles an offset).
+    ShiftOffset(i64),
+    /// pwrite, truncate, fallocate: the call happens, but atime/mtime are put back to what they were before it (a
+    /// file system that does not update mtime there). The kernel stamps ctime when the times are restored, so ctime
+    /// still moves. The save-write-restore sequences of concurrent writes are serialized (the effect would
+    /// otherwise not be well-defined); the calls still overlap as far as the recorder is concerned.
+    RestoreTimes,
+    /// rename: a directory that moved to another parent (both, for `RENAME_EXCHANGE`) gets its mtime set to now
+    /// (a file system that stamps it, which POSIX allows).
+    StampMtime,
 
     // ---- attributes
     /// stat / stat_at / lookup: falsify the returned attributes.
@@ -251,6 +468,8 @@ pub struct FaultBackend {
     faults: RwLock<Vec<Arc<Entry>>>,
     next_id: AtomicU64,
     calls: Vec<AtomicU64>,
+    rec: Recorder,
+    times_lock: Mutex<()>,
 }
 
 /// The effects that fired for one call.
@@ -266,6 +485,9 @@ impl Fx {
                 std::thread::sleep(*d);
             }
         }
+    }
+    fn gates(&self) -> impl Iterator<Item = &Arc<Gate>> {
+        self.0.iter().filter_map(|e| if let Effect::Gate(g) = e { Some(g) } else { None })
     }
     fn errno_before(&self) -> Option<i32> {
         self.0.iter().find_map(|e| if let Effect::Errno(n) = e { Some(*n) } else { None })
@@ -293,6 +515,8 @@ impl FaultBackend {
             faults: RwLock::new(Vec::new()),
             next_id: AtomicU64::new(1),
             calls: FaultOp::ALL.iter().map(|_| AtomicU64::new(0)).collect(),
+            rec: Recorder::default(),
+            times_lock: Mutex::new(()),
         })
     }
 
@@ -343,6 +567,58 @@ impl FaultBackend {
     pub fn reset_calls(&self) {
         for c in &self.calls {
             c.store(0, Relaxed);
+        }
+    }
+
+    /// Switches the in-flight recorder on or off. While on, every call is counted as in flight from its entry
+    /// (before any gate or delay) to its return, per method and per object (`fstat` of the descriptor), see
+    /// [`FaultBackend::max_inflight`]. Costs one `fstat` per call.
+    pub fn record(&self, on: bool) {
+        self.rec.on.store(on, Relaxed);
+    }
+
+    /// Calls of `op` on `obj` right now.
+    pub fn inflight(&self, op: FaultOp, obj: ObjId) -> u32 {
+        self.rec.st.lock().by_obj.get(&(op, obj)).map_or(0, |l| l.cur)
+    }
+
+    /// The largest number of calls of `op` on `obj` that were in flight at once since recording started (or
+    /// `reset_inflight`).
+    pub fn max_inflight(&self, op: FaultOp, obj: ObjId) -> u32 {
+        self.rec.st.lock().by_obj.get(&(op, obj)).map_or(0, |l| l.max)
+    }
+
+    /// Like [`FaultBackend::max_inflight`], over all objects.
+    pub fn max_inflight_any(&self, op: FaultOp) -> u32 {
+        self.rec.st.lock().by_op.get(&op).map_or(0, |l| l.max)
+    }
+
+    /// Recorded calls of `op` on `obj`.
+    pub fn recorded_calls(&self, op: FaultOp, obj: ObjId) -> u64 {
+        self.rec.st.lock().by_obj.get(&(op, obj)).map_or(0, |l| l.total)
+    }
+
+    /// Forgets the maxima and counts (calls in flight stay counted).
+    pub fn reset_inflight(&self) {
+        let mut guard = self.rec.st.lock();
+        let st = &mut *guard;
+        for l in st.by_obj.values_mut().chain(st.by_op.values_mut()) {
+            l.max = l.cur;
+            l.total = 0;
+        }
+    }
+
+    /// Waits until at least `n` calls of `op` on `obj` are in flight at the same moment; false on timeout.
+    pub fn wait_inflight(&self, op: FaultOp, obj: ObjId, n: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut st = self.rec.st.lock();
+        loop {
+            if st.by_obj.get(&(op, obj)).is_some_and(|l| l.cur >= n) {
+                return true;
+            }
+            if self.rec.cv.wait_until(&mut st, deadline).timed_out() {
+                return st.by_obj.get(&(op, obj)).is_some_and(|l| l.cur >= n);
+            }
         }
     }
 
@@ -400,10 +676,31 @@ impl FaultBackend {
         skip_val: Option<T>,
         call: impl FnOnce(&Fx) -> SysResult<T>,
     ) -> SysResult<T> {
+        self.exec2(op, names, fd, None, skip_val, call)
+    }
+
+    /// `exec` for a call that works on two descriptors (`extra` is recorded as well).
+    fn exec2<T>(
+        &self,
+        op: FaultOp,
+        names: &[&[u8]],
+        fd: Option<BorrowedFd<'_>>,
+        extra: Option<BorrowedFd<'_>>,
+        skip_val: Option<T>,
+        call: impl FnOnce(&Fx) -> SysResult<T>,
+    ) -> SysResult<T> {
+        let _rec = if self.rec.on.load(Relaxed) {
+            let fds: Vec<BorrowedFd<'_>> = fd.into_iter().chain(extra).collect();
+            self.rec.enter(&*self.inner, op, &fds)
+        } else {
+            None
+        };
         let fx = self.fire(op, names, fd);
         if fx.none() {
             return call(&fx);
         }
+        // (the tickets mark the call as finished when `exec2` returns, whichever way)
+        let _tickets: Vec<GateTicket> = fx.gates().map(|g| g.pass()).collect();
         fx.delay();
         if let Some(e) = fx.errno_before() {
             return Err(e);
@@ -427,6 +724,22 @@ impl FaultBackend {
         call: impl FnOnce(&Fx) -> SysResult<()>,
     ) -> SysResult<()> {
         self.exec(op, names, fd, Some(()), call)
+    }
+}
+
+impl FaultBackend {
+    /// Runs `call`; with [`Effect::RestoreTimes`], puts the node's atime/mtime back afterwards.
+    fn keeping_times(&self, fx: &Fx, node: BorrowedFd<'_>, file: Option<BorrowedFd<'_>>, call: impl FnOnce() -> SysResult<()>) -> SysResult<()> {
+        if !fx.0.iter().any(|e| matches!(e, Effect::RestoreTimes)) {
+            return call();
+        }
+        let _serial = self.times_lock.lock();
+        let saved = self.inner.stat(node).ok();
+        call()?;
+        if let Some(st) = saved {
+            let _ = self.inner.utimens(node, st.kind(), file, TimeSpec::Set(st.atime), TimeSpec::Set(st.mtime));
+        }
+        Ok(())
     }
 }
 
@@ -471,7 +784,9 @@ impl Backend for FaultBackend {
     }
 
     fn truncate(&self, node: BorrowedFd<'_>, file: Option<BorrowedFd<'_>>, size: u64) -> SysResult<()> {
-        self.exec_unit(FaultOp::Truncate, &[], Some(node), |_| self.inner.truncate(node, file, size))
+        self.exec_unit(FaultOp::Truncate, &[], Some(node), |fx| {
+            self.keeping_times(fx, node, file, || self.inner.truncate(node, file, size))
+        })
     }
 
     fn utimens(
@@ -520,8 +835,22 @@ impl Backend for FaultBackend {
         newname: &CStr,
         flags: u32,
     ) -> SysResult<()> {
-        self.exec_unit(FaultOp::Rename, &[name.to_bytes(), newname.to_bytes()], Some(dir), |_| {
-            self.inner.rename(dir, name, newdir, newname, flags)
+        self.exec_unit(FaultOp::Rename, &[name.to_bytes(), newname.to_bytes()], Some(dir), |fx| {
+            self.inner.rename(dir, name, newdir, newname, flags)?;
+            let moved = || self.inner.stat(dir).ok().map(|s| s.ident()) != self.inner.stat(newdir).ok().map(|s| s.ident());
+            if fx.0.iter().any(|e| matches!(e, Effect::StampMtime)) && moved() {
+                let mut names = vec![(newdir, newname)];
+                if flags & libc::RENAME_EXCHANGE != 0 {
+                    names.push((dir, name));
+                }
+                for (d, n) in names {
+                    if let Ok((fd, st)) = self.inner.lookup(d, n)
+                        && st.kind() == FileKind::Dir {
+                            let _ = self.inner.utimens(std::os::fd::AsFd::as_fd(&fd), FileKind::Dir, None, TimeSpec::Omit, TimeSpec::Now);
+                        }
+                }
+            }
+            Ok(())
         })
     }
 
@@ -555,6 +884,8 @@ impl Backend for FaultBackend {
         self.exec(FaultOp::Pwrite, &[], Some(file), Some(data.len()), |fx| {
             let mut data = std::borrow::Cow::Borrowed(data);
             let mut report = None;
+            let mut at = off;
+            let mut restore = false;
             for e in &fx.0 {
                 match e {
                     Effect::ShortWrite(k) => {
@@ -563,10 +894,17 @@ impl Backend for FaultBackend {
                         report = Some(k);
                     }
                     Effect::CorruptWrite { offset } if *offset < data.len() => data.to_mut()[*offset] ^= 0xff,
+                    Effect::ShiftOffset(k) => at = at.saturating_add_signed(*k),
+                    Effect::RestoreTimes => restore = true,
                     _ => {}
                 }
             }
-            let n = self.inner.pwrite(file, &data, off)?;
+            let _serial = restore.then(|| self.times_lock.lock());
+            let saved = if restore { self.inner.stat(file).ok() } else { None };
+            let n = self.inner.pwrite(file, &data, at)?;
+            if let Some(st) = saved {
+                let _ = self.inner.utimens(file, FileKind::Regular, Some(file), TimeSpec::Set(st.atime), TimeSpec::Set(st.mtime));
+            }
             Ok(report.map(|r| r.min(n)).unwrap_or(n))
         })
     }
@@ -660,7 +998,9 @@ impl Backend for FaultBackend {
     }
 
     fn fallocate(&self, file: BorrowedFd<'_>, mode: i32, off: u64, len: u64) -> SysResult<()> {
-        self.exec_unit(FaultOp::Fallocate, &[], Some(file), |_| self.inner.fallocate(file, mode, off, len))
+        self.exec_unit(FaultOp::Fallocate, &[], Some(file), |fx| {
+            self.keeping_times(fx, file, Some(file), || self.inner.fallocate(file, mode, off, len))
+        })
     }
 
     fn lseek(&self, file: BorrowedFd<'_>, off: i64, whence: i32) -> SysResult<i64> {
@@ -679,7 +1019,7 @@ impl Backend for FaultBackend {
         len: usize,
         flags: u32,
     ) -> SysResult<usize> {
-        self.exec(FaultOp::CopyFileRange, &[], Some(fout), Some(len), |fx| {
+        self.exec2(FaultOp::CopyFileRange, &[], Some(fout), Some(fin), Some(len), |fx| {
             let mut len = len;
             let mut short = None;
             for e in &fx.0 {

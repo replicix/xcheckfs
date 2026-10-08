@@ -186,8 +186,19 @@ pub struct Stats {
     pub secondary_skipped: AtomicU64,
     /// Thorough/paranoid verifications performed.
     pub verifications: AtomicU64,
+    /// Data operations that ran while another data operation on the same
+    /// object was in flight (relaxed serialization at work).
+    pub concurrent_data_ops: AtomicU64,
+    /// Data operations that waited for an overlapping byte range.
+    pub range_waits: AtomicU64,
+    /// Stats whose mtime/ctime comparison was skipped because an in-place
+    /// data operation on the object overlapped them.
+    pub attr_time_skipped: AtomicU64,
     /// Objects repaired from the primary (resync), verified afterwards.
     pub resyncs: AtomicU64,
+    /// Secondary mtimes set to the primary's after an operation that stamps them on one file system only (a
+    /// difference POSIX allows, found by the mount-time probe).
+    pub aligned_mtimes: AtomicU64,
     /// Repairs whose verification failed: the object is left diverged.
     pub resync_failures: AtomicU64,
     /// Repairs skipped because the object exceeded its repair budget.
@@ -216,7 +227,11 @@ impl Default for Stats {
             repeats: AtomicU64::new(0),
             secondary_skipped: AtomicU64::new(0),
             verifications: AtomicU64::new(0),
+            concurrent_data_ops: AtomicU64::new(0),
+            range_waits: AtomicU64::new(0),
+            attr_time_skipped: AtomicU64::new(0),
             resyncs: AtomicU64::new(0),
+            aligned_mtimes: AtomicU64::new(0),
             resync_failures: AtomicU64::new(0),
             resync_giveups: AtomicU64::new(0),
             quarantined: AtomicU64::new(0),
@@ -244,7 +259,11 @@ pub struct StatsSnapshot {
     pub repeats: u64,
     pub secondary_skipped: u64,
     pub verifications: u64,
+    pub concurrent_data_ops: u64,
+    pub range_waits: u64,
+    pub attr_time_skipped: u64,
     pub resyncs: u64,
+    pub aligned_mtimes: u64,
     pub resync_failures: u64,
     pub resync_giveups: u64,
     pub quarantined: u64,
@@ -299,7 +318,11 @@ impl Stats {
             repeats: l(&self.repeats),
             secondary_skipped: l(&self.secondary_skipped),
             verifications: l(&self.verifications),
+            concurrent_data_ops: l(&self.concurrent_data_ops),
+            range_waits: l(&self.range_waits),
+            attr_time_skipped: l(&self.attr_time_skipped),
             resyncs: l(&self.resyncs),
+            aligned_mtimes: l(&self.aligned_mtimes),
             resync_failures: l(&self.resync_failures),
             resync_giveups: l(&self.resync_giveups),
             quarantined: l(&self.quarantined),

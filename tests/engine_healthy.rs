@@ -7,10 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::*;
-use xcheckfs::config::{CheckLevel, MismatchMode};
+use xcheckfs::config::{CheckLevel, MismatchMode, Serialization};
 use xcheckfs::engine::SetAttr;
 
 const LEVELS: [CheckLevel; 3] = [CheckLevel::Basic, CheckLevel::Thorough, CheckLevel::Paranoid];
+/// The concurrency tests run with both serializations (`--serialize strict|relaxed`).
+const SERS: [Serialization; 2] = [Serialization::Strict, Serialization::Relaxed];
 
 /// A broad deterministic workload touching every engine operation, including the error paths.
 fn broad_workload(h: &Harness, xattrs: bool, exotic: bool) {
@@ -335,15 +337,17 @@ fn random_single_thread_all_levels() {
 /// Many threads, one shared small namespace: every conflicting pair of operations races. With correct locking the
 /// two file systems always see the same order, so the result must be ZERO mismatches.
 fn stress(level: CheckLevel, threads: usize, ops: usize) {
-    stress_with(level, threads, ops, false)
+    for ser in SERS {
+        stress_with(level, threads, ops, false, ser)
+    }
 }
 
 /// `slow`: random 1 ms delays on both backends' calls widen every race window between the two halves of an
 /// operation; the locks must still keep both sides in the same order.
-fn stress_with(level: CheckLevel, threads: usize, ops: usize, slow: bool) {
+fn stress_with(level: CheckLevel, threads: usize, ops: usize, slow: bool, ser: Serialization) {
     let ops = ops * soak();
     // (slow runs record the engine's event stream: on a failure it is the timeline of what happened to the object)
-    let h = Arc::new(Harness::builder().level(level).events(if slow { 500_000 } else { 1 }).build());
+    let h = Arc::new(Harness::builder().level(level).events(if slow { 500_000 } else { 1 }).config(move |c| c.serialize = ser).build());
     if slow {
         use xcheckfs::backend::fault::{Effect, Fault, FaultOp::*};
         for op in [Pwrite, Pread, Rename, Unlink, Create, Mkdir, Link, Stat, StatAt, Lookup, Readdir, Truncate, Open, Rmdir, Symlink] {
@@ -371,7 +375,7 @@ fn stress_with(level: CheckLevel, threads: usize, ops: usize, slow: bool) {
     }
     let ops_done: u64 = xcheckfs::stats::OpKind::ALL.iter().map(|&k| h.stats.op(k).count.load(Ordering::Relaxed)).sum();
     let errors: u64 = xcheckfs::stats::OpKind::ALL.iter().map(|&k| h.stats.op(k).errors.load(Ordering::Relaxed)).sum();
-    eprintln!("stress {level:?} slow={slow}: {ops_done} engine ops, {errors} returned errors");
+    eprintln!("stress {level:?} {ser:?} slow={slow}: {ops_done} engine ops, {errors} returned errors");
     if slow && !h.mismatches().is_empty() {
         use xcheckfs::events::UiEvent;
         let evs: Vec<_> = h.events.as_ref().unwrap().try_iter().collect();
@@ -403,8 +407,10 @@ fn stress_with(level: CheckLevel, threads: usize, ops: usize, slow: bool) {
 
 #[test]
 fn stress_mixed_slow_secondary() {
-    stress_with(CheckLevel::Thorough, 12, 400, true);
-    stress_with(CheckLevel::Paranoid, 8, 300, true);
+    for ser in SERS {
+        stress_with(CheckLevel::Thorough, 12, 400, true, ser);
+        stress_with(CheckLevel::Paranoid, 8, 300, true, ser);
+    }
 }
 
 #[test]
@@ -582,8 +588,8 @@ fn stress_rename_trees() {
 /// Append-only writers on the same file from many threads: the kernel serialises O_APPEND writes, so must we.
 #[test]
 fn concurrent_appends_same_file() {
-    for level in LEVELS {
-        let h = Arc::new(Harness::new(level, MismatchMode::Log));
+    for (level, ser) in LEVELS.into_iter().flat_map(|l| SERS.map(|s| (l, s))) {
+        let h = Arc::new(Harness::builder().level(level).config(move |c| c.serialize = ser).build());
         h.write_file("/log", b"");
         let ts: Vec<_> = (0..8)
             .map(|t| {
@@ -636,27 +642,29 @@ fn cross_filesystem_pair_no_mismatch() {
 /// final data on both sides.
 #[test]
 fn racing_overlapping_writers_end_identical() {
-    let h = Arc::new(Harness::new(CheckLevel::Paranoid, MismatchMode::Log));
-    h.write_file("/o", &vec![0u8; 8192]);
-    let ts: Vec<_> = (0..6)
-        .map(|t| {
-            let h = h.clone();
-            std::thread::spawn(move || {
-                let f = h.open("/o", libc::O_RDWR);
-                for i in 0..300 {
-                    let off = (i * 37 + t * 11) % 4000;
-                    h.pwrite(f, off as u64, &vec![t as u8 + 1; 3000 + (i % 50)]);
-                    let _ = h.pread(f, 0, 8192);
-                }
-                h.close(f);
+    for ser in SERS {
+        let h = Arc::new(Harness::builder().level(CheckLevel::Paranoid).config(move |c| c.serialize = ser).build());
+        h.write_file("/o", &vec![0u8; 8192]);
+        let ts: Vec<_> = (0..6)
+            .map(|t| {
+                let h = h.clone();
+                std::thread::spawn(move || {
+                    let f = h.open("/o", libc::O_RDWR);
+                    for i in 0..300 {
+                        let off = (i * 37 + t * 11) % 4000;
+                        h.pwrite(f, off as u64, &vec![t as u8 + 1; 3000 + (i % 50)]);
+                        let _ = h.pread(f, 0, 8192);
+                    }
+                    h.close(f);
+                })
             })
-        })
-        .collect();
-    for t in ts {
-        t.join().unwrap();
+            .collect();
+        for t in ts {
+            t.join().unwrap();
+        }
+        h.assert_no_mismatches();
+        h.assert_trees_equal();
     }
-    h.assert_no_mismatches();
-    h.assert_trees_equal();
 }
 
 /// The kernel evicts and re-looks-up inodes all the time: lookups and forgets of the very same inode racing in several
@@ -711,13 +719,14 @@ fn concurrent_lookup_and_forget_of_the_same_inode() {
 /// are different code paths with the same guarantees.
 #[test]
 fn stress_sequential_halves_and_few_stripes() {
-    for (parallel, stripes) in [(false, 4096usize), (true, 16), (false, 16)] {
+    for (parallel, stripes, ser) in SERS.into_iter().flat_map(|s| [(false, 4096usize, s), (true, 16, s), (false, 16, s)]) {
         let h = Arc::new(
             Harness::builder()
                 .level(CheckLevel::Thorough)
                 .config(move |c| {
                     c.parallel = parallel;
                     c.lock_stripes = stripes;
+                    c.serialize = ser;
                 })
                 .build(),
         );

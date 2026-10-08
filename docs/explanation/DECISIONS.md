@@ -30,7 +30,7 @@ chunks for the same reason.
 
 ## ADR-3: Stripe locks, not a global lock
 
-**Decision**: 4096 reader/writer locks selected by a hash of the node id; each
+**Decision**: reader/writer locks (65536 by default, `--lock-stripes`) selected by a hash of the node id; each
 operation takes the stripes of every object it observes or changes, all at
 once, in stripe order, with name -> inode re-validation.
 **Rejected**: one global lock — correct but serializes the whole workload and
@@ -49,8 +49,9 @@ the backends when opening.
 offsets, which the FUSE layer cannot guarantee for the backend's `pread` and
 `pwrite`, and it changes caching, not semantics. The kernel's FUSE layer
 still handles the caller-visible part. `--direct-io` is a different thing: it
-bypasses the *kernel page cache in front of xcheckfs* so every read and write
-reaches the engine ([Limitations](../reference/limitations.md)).
+bypasses the *kernel page cache in front of xcheckfs* (for files opened with
+`O_DIRECT` by default, for every file with `all`) so the reads and writes
+reach the engine ([Limitations](../reference/limitations.md)).
 
 ## ADR-5: ctime is tracked as a change, not as a value
 
@@ -150,3 +151,75 @@ object runs inside the operation that hit the mismatch and blocks the object
 meanwhile. The secondary is pushed back to the primary's state, so a clean
 end state proves nothing: the mismatch counter is the result
 ([Limitations](../reference/limitations.md#repair)).
+
+## ADR-12: Relaxed serialization: byte-range locks for in-place data operations
+
+**Decision**: with `--serialize relaxed` (the default), `read`, `write`,
+`fallocate` and the `copy_file_range` destination that change neither the
+file's size nor its metadata take the object's stripe shared plus a
+first-come-first-served byte-range lock (exclusive for writers, shared for
+readers), held across both halves. Disjoint ranges of one file therefore run
+concurrently on both file systems; overlapping ranges are ordered by the lock
+and execute in that order on both sides. Everything that changes the size or
+is not purely in place (`O_APPEND`, writes past the end, `truncate`,
+`setattr`, `fallocate` that extends or collapses/inserts, files with
+set-uid/set-gid bits) stays exclusive. A stat that overlapped an in-place
+write skips the `mtime`/`ctime` comparison (the racy-stat rule), keeps the
+ctime baseline, and `thorough` adds a per-write check that each side's
+`mtime` is not older than the write's start ([Design](DESIGN.md#concurrent-data-operations)).
+**Why**: the operations that matter most for testing a file system, parallel
+I/O to the same file by databases and similar applications, are the ones
+where concurrency bugs live. Serializing them in the mirror hides those bugs
+from the experimental file system, so the change is about coverage first and
+speed second.
+**Rejected**: strict per-object exclusive writes (the previous behavior, still
+available as `--serialize strict`): it never presents the secondary with two
+writes to one file at once, which hides concurrency defects, and it makes
+the mirror slower than the workload needs to be. No ordering at all: two
+overlapping writes could then be applied in different orders on the two file
+systems, leaving different bytes behind, which would be reported as a
+mismatch (and repaired in `resync` mode) although neither file system is
+wrong. Comparing timestamps of racing stats anyway: one side would have
+stamped a concurrent write that the other has not yet, a false `attr` mismatch
+with a window as wide as the slower file system.
+**Consequence accepted**: time comparison is lost for a stat that overlapped
+an in-place write: `mtime` and `ctime` of that stat are not compared, and the
+`thorough` write check and the next quiet stat are what catch a file system
+that does not update them. Other attributes are compared as always.
+`FUSE_HANDLE_KILLPRIV_V2` is deliberately not enabled: the file system would
+have to clear set-uid and set-gid bits on write itself, and that behavior
+would have to be mirrored and compared on both sides; deferred.
+
+## ADR-13: Adapt to legitimate file-system differences found by a mount-time probe
+
+**Decision**: at mount (unless `--no-probe`) a few operations run in a
+scratch directory at the root of each tree and show, per file system, where
+POSIX leaves a choice: whether a directory's link count counts its
+subdirectories, whether moving or exchanging directories across parents
+stamps their `mtime`, whether a truncate to the current size does (by path and
+by descriptor), whether punching a hole where there is no data does. Where the
+two file systems differ, the engine adapts: directory link counts are not
+compared; otherwise, right after exactly that operation in exactly that
+situation, the secondary's `mtime` is set to the primary's (`utimens`) and the
+node's ctime baseline is reset. Optional operations that only one side
+supports (`fallocate` modes) are not adapted to: they are logged at warn
+level with the allow rule that accepts them. Adaptations and gaps are listed
+in `ctl status` ([Design](DESIGN.md#mount-time-probe)).
+**Why**: these differences are properties of correct file systems, so
+reporting them is noise that hides real mismatches; and the experimental file
+system under test has no known type.
+**Rejected**:
+- A table keyed by file system magic: it does not cover an experimental file
+  system, and goes stale as file systems change between kernel versions.
+- Skipping the `mtime` comparison per node until its next change: it needs
+  state per node, and hides more, including a secondary that never stamps
+  `mtime` where it must.
+- Leaving it to the user with allow rules: manual, and the same noise until
+  the rules exist; a rule cannot tell the legitimate case from a defect of the
+  same field.
+**Consequence accepted**: the probe writes a scratch directory into each
+root (the roots' ctime changes; atime and mtime are restored), and the
+secondary's `mtime` is modified by xcheckfs (`utimens`, which also moves its
+ctime). A root that is not writable is not probed and nothing is adapted. The
+adaptation is limited to the exact situation, so a secondary that does not
+stamp `mtime` elsewhere is still reported.

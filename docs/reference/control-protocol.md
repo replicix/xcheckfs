@@ -26,8 +26,9 @@ use the same spelling for `mount` and `ctl`, or pass `--socket`:
 
 File name: the last path component (ASCII letters, digits, `.`, `_`, `-`;
 at most 24 characters), a dash, and 16 hex digits of a hash of the full path,
-plus `.sock` — for `/mnt/data`, `data-<hash>.sock`. The directory is created
-with mode `0700` and the socket is `0600`. A stale socket file is replaced; a
+plus `.sock` — for `/mnt/data`, `data-<hash>.sock`. A directory xcheckfs creates
+gets mode `0700`; an existing one (say `/run`) keeps its mode. The socket is
+`0600`. A stale socket file is replaced; a
 socket another xcheckfs is listening on is an error. The socket is removed on
 unmount. The path must not be inside a mirrored tree.
 
@@ -68,7 +69,7 @@ letters `c`, `r`, `s`, `e`, `d` are accepted for `continue`, `retry`,
 
 | Field | Meaning |
 |---|---|
-| `info` | `mountpoint`, `primary`, `secondary`, `check`, `pid` |
+| `info` | `mountpoint`, `primary`, `secondary`, `check`, `pid`, `adaptations`, `capability_gaps` |
 | `state` | `running`, `frozen` or `detached` |
 | `mode` | current mismatch mode |
 | `uptime_secs` | |
@@ -79,6 +80,10 @@ letters `c`, `r`, `s`, `e`, `d` are accepted for `continue`, `retry`,
 | `pending` | frozen mismatches awaiting a decision |
 | `secondary_skipped` | operations whose secondary half was skipped because the object does not exist on the secondary |
 | `verifications` | read-backs and content/listing comparisons done at `thorough`/`paranoid` |
+| `concurrent_data_ops` | in-place writing operations (`write`, `fallocate`, `copy_file_range` destination; [relaxed serialization](../explanation/DESIGN.md#concurrent-data-operations)) that started while another one on the same file was in flight; reads are not counted |
+| `range_waits` | data operations (reads included) that had to wait for an overlapping byte range held or queued by another |
+| `attr_time_skipped` | attribute comparisons whose `mtime` and `ctime` were skipped because an in-place data operation overlapped the stat (the [racy-stat rule](checks.md#racy-stats)) |
+| `aligned_mtimes` | times the secondary's `mtime` was set to the primary's right after an operation that one of the file systems stamps and the other does not ([mount-time probe](fs-differences.md#the-mount-time-probe)) |
 | `resyncs` | [repairs](../explanation/DESIGN.md#repair-resync) that verified |
 | `resync_failures` | repairs whose verification failed |
 | `resync_giveups` | repairs refused because the path reached `--resync-limit` |
@@ -86,6 +91,20 @@ letters `c`, `r`, `s`, `e`, `d` are accepted for `continue`, `retry`,
 | `bytes_read`, `bytes_written` | |
 | `nodes`, `open_files`, `open_dirs` | cached inodes and open handles |
 | `lock_waiters` | blocking lock requests queued |
+
+`info.adaptations` and `info.capability_gaps` are arrays of strings, empty
+when there is nothing to report, and always empty with `--no-probe`. They
+are fixed at mount, from the
+[mount-time probe](fs-differences.md#the-mount-time-probe):
+
+- `adaptations`: one string per difference the engine adapts to (directory
+  link counts not compared; secondary `mtime` aligned after a moved or
+  exchanged directory, a truncate to the current size, a hole punched where
+  there is no data). Each was also logged at info level.
+- `capability_gaps`: one string per `fallocate` mode only one side supports,
+  with the [allow rule](rules.md) that accepts the resulting `fallocate`
+  `result` mismatches. Each was also logged at warn level. Nothing is
+  allowed automatically.
 
 ### Mismatch
 
