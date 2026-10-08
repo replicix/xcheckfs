@@ -85,6 +85,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   times: a later `getattr` of the directory could report an `mtime` mismatch
   when the directory's last real change was more than `--time-tolerance` ago.
 
+- The stress lane (`tests/external/run-stress.sh`) runs stress-ng `fpunch`
+  without `--verify` where the trees refuse `FALLOC_FL_ZERO_RANGE` (tmpfs):
+  stress-ng then falls back to a plain allocation that zeroes nothing, and its
+  read-back check failed every run, with or without xcheckfs.
+
 ## [0.1.2]
 
 ### Changed

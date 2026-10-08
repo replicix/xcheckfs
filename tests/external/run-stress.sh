@@ -88,6 +88,15 @@ if [ "$cross" = 1 ]; then
     [ -e /sys/fs/selinux/enforce ] && verify_extra="$verify_extra --no-xattrs"
     echo "== different file systems ($pfs, $sfs): --no-dir-nlink; skipping stressors: $skip_extra"
 fi
+# fpunch --verify reads back a range after FALLOC_FL_ZERO_RANGE and expects zeros; where ZERO_RANGE is refused
+# (tmpfs), stress-ng falls back to a plain allocation that zeroes nothing and fails every run, with or without
+# xcheckfs. There fpunch runs without --verify: the fallocate traffic through the mount is still checked.
+noverify=
+zr_ok() { local f=$1/.xcheckfs-zero-range rc; printf 'x' > "$f" && fallocate -z -o 0 -l 1 "$f" 2>/dev/null; rc=$?; rm -f "$f"; return "$rc"; }
+if command -v fallocate >/dev/null && ! { zr_ok "$primary" && zr_ok "$secondary"; }; then
+    noverify=fpunch
+    echo "== FALLOC_FL_ZERO_RANGE not supported ($pfs, $sfs): stress-ng fpunch runs without --verify"
+fi
 
 
 pid=
@@ -227,7 +236,8 @@ run_fio() {
 }
 
 # -- stress-ng -----------------------------------------------------------------------------------------------------
-# Name|extra options|needs root. `--verify` is added everywhere (stressors without verification ignore it).
+# Name|extra options|needs root. `--verify` is added everywhere (stressors without verification ignore it), except to
+# fpunch where ZERO_RANGE is refused (see above).
 # lockf runs blocking: its workers form lock cycles (answered EDEADLK, like the kernel does) and are stopped with
 # signals while waiting (EINTR).
 # Not run: stressors about ioctls (chattr, fiemap, file-ioctl, inode-flags, verity: ioctl is not mirrored),
@@ -289,9 +299,11 @@ ng_wanted() {
 # ng_run NAME OPTIONS...: one stressor with $workers workers inside the mount. stress-ng exit codes: 0 ok;
 # 3 (could not initialise: missing permission or feature) and 5 (not implemented) are skips; anything else fails.
 ng_run() {
-    local name=$1 rc
+    local name=$1 rc verify=--verify
     shift
-    bounded $((ng_secs + 120)) stress-ng --"$name" "$workers" --timeout "${ng_secs}s" --verify --temp-path "$mnt/stress-ng" \
+    [ "$name" = "$noverify" ] && verify=
+    # shellcheck disable=SC2086
+    bounded $((ng_secs + 120)) stress-ng --"$name" "$workers" --timeout "${ng_secs}s" $verify --temp-path "$mnt/stress-ng" \
         --metrics --times "$@" > "$base/stress-ng-$name.out" 2>&1
     rc=$?
     case "$rc" in
