@@ -9,8 +9,8 @@
 #                         writable or running as root, else ~/.local/bin)
 #   XCHECKFS_BASE_URL     download from this URL (a mirror) instead of GitHub
 #
-# While the repository is private, downloads need an authenticated GitHub
-# CLI (`gh auth login`); it is used automatically when available.
+# An authenticated GitHub CLI (`gh`) is used for the download when
+# available; otherwise curl.
 set -eu
 
 REPO=replicix/xcheckfs
@@ -49,7 +49,7 @@ else
     fi
     for f in "$asset" SHA256SUMS; do
         curl -fsSL -o "$tmp/$f" "$base/$f" ||
-            die "download of $f failed (a private repository needs 'gh auth login')"
+            die "download of $f failed"
     done
 fi
 

@@ -44,10 +44,6 @@ sudo dnf install ./xcheckfs-*.x86_64.rpm
 cargo build --release            # binary: target/release/xcheckfs
 ```
 
-While the repository is private, download with an authenticated GitHub CLI:
-`gh release download -R replicix/xcheckfs -p install.sh -O - | sh` (the
-script then uses `gh` too).
-
 ## Quick start
 
 ```bash

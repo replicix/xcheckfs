@@ -6,9 +6,10 @@ POSIX conformance suite (or, for the stress lane, a load) inside the mount, ask 
 unmount it, and exit non-zero if the suite failed or xcheckfs recorded any mismatch. The environment variables
 (`XCHECKFS`, `CHECK`, `KEEP`, ...) are listed at the top of each script.
 
-`run-libfuse-syscalls.sh` compiles `test/test_syscalls.c` from a libfuse source tree (`$LIBFUSE_SRC`, default
-`/tmp/libfuse`; the meson-generated `fuse_config.h` is replaced by a two-line stub) into the cache directory and runs it
-against the mount as the current user; no root and no network are needed. `UNLINKED_TEST=1` additionally runs the
+`run-libfuse-syscalls.sh` compiles `test/test_syscalls.c` from a libfuse source tree (`$LIBFUSE_SRC`; by default
+libfuse is cloned into `$XDG_CACHE_HOME/xcheckfs-tests/libfuse` the first time; the meson-generated `fuse_config.h` is
+replaced by a two-line stub) into the cache directory and runs it against the mount as the current user; no root is
+needed. `UNLINKED_TEST=1` additionally runs the
 open-but-unlinked tests, `TEST_ARGS="3 -17"` selects or skips individual test numbers.
 
 `run-pjdfstest.sh` needs root (the suite changes users and creates device nodes). It clones and builds pjdfstest into

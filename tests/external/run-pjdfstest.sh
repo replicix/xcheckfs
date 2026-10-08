@@ -30,7 +30,7 @@ if [ -z "$bin" ]; then
     for c in "$repo/target/release/xcheckfs" "$repo/target/debug/xcheckfs"; do [ -x "$c" ] && { bin=$c; break; }; done
 fi
 if [ -z "$bin" ]; then
-    (cd "$repo" && cargo build --offline --quiet) || die "cargo build failed"
+    (cd "$repo" && cargo build --locked --quiet) || die "cargo build failed"
     bin=$repo/target/debug/xcheckfs
 fi
 [ -x "$bin" ] || die "xcheckfs binary $bin not found"

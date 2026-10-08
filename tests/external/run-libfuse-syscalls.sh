@@ -2,8 +2,12 @@
 # Runs libfuse's test_syscalls (a POSIX syscall conformance test) against an xcheckfs mount of two scratch
 # directories and fails if the test fails OR xcheckfs recorded any mismatch between primary and secondary.
 #
+# Needs network access the first time (libfuse is cloned into the cache directory unless LIBFUSE_SRC points to a
+# checkout).
+#
 # Environment:
-#   LIBFUSE_SRC   libfuse source tree (default /tmp/libfuse)
+#   LIBFUSE_SRC   libfuse source tree (default $XDG_CACHE_HOME/xcheckfs-tests/libfuse, cloned if missing)
+#   LIBFUSE_REPO  where to clone from (default https://github.com/libfuse/libfuse)
 #   XCHECKFS      xcheckfs binary (default: target/release|debug/xcheckfs of this repo, built if missing)
 #   CHECK         basic | thorough | paranoid (default thorough)
 #   TEST_ARGS     extra arguments for test_syscalls, e.g. "3 -17" (select/skip tests)
@@ -12,11 +16,16 @@ set -u -o pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$here/../.." && pwd)
-src=${LIBFUSE_SRC:-/tmp/libfuse}
 check=${CHECK:-thorough}
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/xcheckfs-tests
+src=${LIBFUSE_SRC:-$cache/libfuse}
 
 die() { echo "ERROR: $*" >&2; exit 2; }
+
+if [ -z "${LIBFUSE_SRC:-}" ] && [ ! -d "$src/.git" ]; then
+    mkdir -p "$cache"
+    git clone --depth 1 "${LIBFUSE_REPO:-https://github.com/libfuse/libfuse}" "$src" || die "cloning libfuse failed"
+fi
 
 [ -f "$src/test/test_syscalls.c" ] || die "$src/test/test_syscalls.c not found (set LIBFUSE_SRC to a libfuse checkout)"
 command -v fusermount3 >/dev/null || die "fusermount3 not found"
@@ -27,7 +36,7 @@ if [ -z "$bin" ]; then
     for c in "$repo/target/release/xcheckfs" "$repo/target/debug/xcheckfs"; do [ -x "$c" ] && { bin=$c; break; }; done
 fi
 if [ -z "$bin" ]; then
-    (cd "$repo" && cargo build --offline --quiet) || die "cargo build failed"
+    (cd "$repo" && cargo build --locked --quiet) || die "cargo build failed"
     bin=$repo/target/debug/xcheckfs
 fi
 [ -x "$bin" ] || die "xcheckfs binary $bin not found"
