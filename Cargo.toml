@@ -1,6 +1,6 @@
 [package]
 name = "xcheckfs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MPL-2.0"
 description = "A FUSE file system that mirrors every operation to a reference and an experimental file system in lockstep and reports any disagreement"

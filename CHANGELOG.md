@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2]
+
+### Changed
+
+- Dependencies: `toml` 1.1 (from 0.8), `signal-hook` 0.4 (from 0.3),
+  `globset` 0.4.20.
+- Release and CI workflows: `actions/checkout` v7, `actions/upload-artifact`
+  v6 and `actions/download-artifact` v7 (Node.js 24 runtime).
+
 ## [0.1.1]
 
 ### Fixed
@@ -62,6 +71,7 @@ Initial release.
   `.rpm` packages, and an installer script.
 - Documentation in the Diátaxis layout under `docs/`.
 
-[Unreleased]: https://github.com/replicix/xcheckfs/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/replicix/xcheckfs/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/replicix/xcheckfs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/replicix/xcheckfs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/replicix/xcheckfs/releases/tag/v0.1.0
