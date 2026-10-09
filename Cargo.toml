@@ -31,9 +31,9 @@ clap = { version = "4.5", features = ["derive", "wrap_help"] }
 crossbeam-channel = "0.5"
 crossterm = "0.29"
 # fuser 0.18.0 plus replicix's changes (github.com/replicix/fuser, REPLICIX.md):
-# session handover, the io_uring transport (feature `io-uring`, unused
-# yet), FUSE_INTERRUPT. Pinned by rev.
-fuser = { git = "https://github.com/replicix/fuser", rev = "8b1c141b1352f377e42c8981e1183316591129fe" }
+# session handover, the io_uring transport (--io-uring), FUSE_INTERRUPT.
+# Pinned by rev.
+fuser = { git = "https://github.com/replicix/fuser", rev = "b6af219f908f0fc21d44e7058c39b04934a7d9fa", features = ["io-uring"] }
 globset = "0.4"
 libc = "0.2"
 # musl's allocator is slow under multithreaded load; the release binaries

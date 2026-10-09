@@ -136,6 +136,18 @@ struct MountArgs {
     /// at most 64].
     #[arg(long)]
     threads: Option<usize>,
+    /// Serve FUSE over io_uring (Linux 6.14+, fuse module parameter
+    /// enable_uring=Y) instead of reading /dev/fuse; falls back to /dev/fuse
+    /// with a warning where the kernel does not offer it. Less CPU per
+    /// operation, but a call that stalls in a backend (a journal commit)
+    /// holds up the other requests of its CPU.
+    #[arg(long)]
+    io_uring: bool,
+    /// Requests in flight per CPU queue with --io-uring. A blocking lock
+    /// wait holds an entry, and at most depth - 1 of them may wait at once
+    /// on one queue: past that, F_SETLKW is answered ENOLCK.
+    #[arg(long, default_value_t = 64)]
+    io_uring_depth: u32,
     /// Run the secondary half of each operation after the primary instead of
     /// concurrently.
     #[arg(long)]
@@ -520,6 +532,11 @@ fn run_mount(
     fcfg.acl = if allow_other { fuser::SessionACL::All } else { fuser::SessionACL::Owner };
     fcfg.n_threads = Some(threads.max(1));
     fcfg.clone_fd = threads > 1;
+    fcfg.io_uring = a.io_uring;
+    fcfg.io_uring_queue_depth = a.io_uring_depth.max(1);
+    // Both sides are local file systems: every request but the ones that wait
+    // (locks, fsync, fallocate, copies) is served on the ring thread.
+    fcfg.io_uring_dispatch = fuser::RingDispatch::AllButWaits;
 
     let session = fuser::Session::new(XcheckFs { engine: engine.clone() }, &mountpoint, &fcfg)
         .with_context(|| format!("mount on {}", mountpoint.display()))?;

@@ -981,7 +981,10 @@ impl Engine {
         self.run(OpKind::Fsync, ino, || self.detail_ino(ino), |cx| {
             let f = self.file(fh)?;
             let n = &f.node;
-            let _l = self.lock(&[(n.id, false)]);
+            // No object lock: an fsync changes nothing either side compares,
+            // and can take seconds. Held shared, it parked the first
+            // exclusive request behind it, and every later one behind that
+            // (a directory's lookups behind a create, for a whole fsyncdir).
             let sec = !self.detached() && f.has_sec();
             let (p, s) = self.both(cx, sec, None, |side, be| be.fsync(f.fd(side).as_fd(), datasync));
             self.cmp_result(cx, n, None, &p, &s, false)?;
@@ -1300,7 +1303,7 @@ impl Engine {
         self.run(OpKind::Fsyncdir, ino, || self.detail_ino(ino), |cx| {
             let d = self.dir(fh)?;
             let n = &d.node;
-            let _l = self.lock(&[(n.id, false)]);
+            // No object lock, as fsync.
             let sec = !self.detached() && d.has_sec();
             let (p, s) = self.both(cx, sec, None, |side, be| be.fsync(d.fd(side).as_fd(), datasync));
             self.cmp_result(cx, n, None, &p, &s, false)?;

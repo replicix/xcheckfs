@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `--io-uring` serves FUSE over io_uring (Linux 6.14+, `fuse.enable_uring=Y`;
+  falls back to `/dev/fuse` with a warning) with every request but lock
+  waits, `fsync`, `fallocate` and copies dispatched on the ring threads:
+  less CPU per operation, but a call that stalls in a backend holds up the
+  other requests of its CPU. `--io-uring-depth` (default 64) sets the
+  entries per CPU queue. fuser now comes from
+  [replicix/fuser](https://github.com/replicix/fuser).
 - Relaxed serialization (`--serialize relaxed`, the default): reads, in-place
   writes, `fallocate` and `copy_file_range` that change neither a file's size
   nor its metadata hold a byte-range lock instead of the whole object, so
@@ -79,6 +86,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `fsync` and `fsyncdir` no longer hold the object's lock. An `fsyncdir`
+  under directory churn takes seconds on ext4; holding the directory shared,
+  it queued the next create behind it, and every lookup in the directory
+  behind the create.
 - Running out of descriptors no longer makes the two sides disagree: every
   descriptor xcheckfs keeps is counted, and an operation first reserves the
   most it can create. One that does not fit under `RLIMIT_NOFILE` fails with

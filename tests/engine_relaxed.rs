@@ -1749,3 +1749,38 @@ fn shift_offset_and_restore_times_effects() {
     fb.pwrite(a.as_fd(), b"R", 5).unwrap();
     assert!(fb.stat(a.as_fd()).unwrap().mtime > old, "a write without the effect stamps the time");
 }
+
+/// An fsync changes nothing either side compares, and can take seconds (an ext4 `fsyncdir` under directory
+/// churn took up to 5 s): it must not hold the object, or a create in the directory waits for it, and every
+/// lookup there queues behind the create.
+#[test]
+fn fsync_and_fsyncdir_do_not_hold_the_object() {
+    for dir in [false, true] {
+        let r = rig(CheckLevel::Thorough, Serialization::Relaxed);
+        r.h.mkdir("/d");
+        r.h.write_file("/d/f", b"x");
+        let (path, ino) = if dir { ("/d", r.h.lookup("/d").id) } else { ("/d/f", r.h.lookup("/d/f").id) };
+        let fh = if dir { r.h.engine.opendir(&r.h.ctx, ino).unwrap() } else { r.h.open(path, libc::O_RDWR).fh };
+        let g = r.sgate(FaultOp::Fsync, path);
+        let h = r.h.clone();
+        let sync = std::thread::spawn(move || {
+            if dir { h.engine.fsyncdir(&h.ctx, ino, fh, false) } else { h.engine.fsync(&h.ctx, ino, fh, false) }
+        });
+        assert!(g.wait_arrived(1, WAIT), "{path}: the fsync reaches the secondary");
+        // While it is held there: a create in the directory, a change of the object itself.
+        let h = r.h.clone();
+        let other = std::thread::spawn(move || {
+            h.mkdir("/d/sub");
+            h.chmod(path, 0o700);
+        });
+        let deadline = std::time::Instant::now() + WAIT;
+        while !other.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(other.is_finished(), "{path}: a create and a chmod waited for the fsync");
+        other.join().unwrap();
+        g.open();
+        sync.join().unwrap().expect("fsync");
+        r.finish();
+    }
+}
