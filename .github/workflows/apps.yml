@@ -74,13 +74,20 @@ jobs:
 
       - name: Prepare
         run: |
-          # Docker Hub rate-limits anonymous pulls from shared runners; pull
-          # through Google's mirror of it (images it lacks still come from the Hub).
-          f=/etc/docker/daemon.json
-          { [ -s $f ] && sudo cat $f || echo '{}'; } | jq '. + {"registry-mirrors": ["https://mirror.gcr.io"]}' >/tmp/daemon.json
-          sudo mv /tmp/daemon.json $f
-          sudo systemctl restart docker
-          docker info --format '{{.RegistryConfig.Mirrors}}'
+          # Docker Hub rate-limits anonymous pulls from shared runners, and the
+          # runner's Docker ignores daemon.json's registry-mirrors: pull the
+          # images from Google's mirror of the Hub and give them their Hub
+          # names (the run scripts only pull what is missing; docker build
+          # takes a local base image).
+          case "${{ matrix.app }}" in
+            postgres) images="postgres:18" ;;
+            mysql) images="mysql:8.4 alpine:3.20 ubuntu:24.04" ;;
+            sqlite) images="python:3-alpine" ;;
+          esac
+          for i in $images; do
+            docker pull -q "mirror.gcr.io/library/$i"
+            docker tag "mirror.gcr.io/library/$i" "$i"
+          done
           chmod +x bin/xcheckfs
           mkdir -p "$OUT"
           bin/xcheckfs --version
