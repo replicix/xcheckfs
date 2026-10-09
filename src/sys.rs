@@ -394,6 +394,17 @@ pub fn raise_nofile_limit() -> u64 {
     rl.rlim_cur
 }
 
+/// The soft RLIMIT_NOFILE (`u64::MAX`: unlimited or unknown).
+pub fn nofile_limit() -> u64 {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: valid out pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+        rl.rlim_cur
+    } else {
+        u64::MAX
+    }
+}
+
 pub fn dup(fd: BorrowedFd<'_>) -> SysResult<OwnedFd> {
     // SAFETY: valid fd.
     owned(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) })

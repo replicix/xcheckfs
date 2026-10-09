@@ -129,6 +129,9 @@ fn status(sh: &Shared) -> Value {
         "open_files": s.open_files,
         "open_dirs": s.open_dirs,
         "lock_waiters": s.lock_waiters,
+        "fds_held": crate::engine::fds::held(),
+        "fds_budget": s.fd_budget,
+        "fd_refusals": s.fd_refusals,
     })
 }
 

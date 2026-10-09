@@ -79,6 +79,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Running out of descriptors no longer makes the two sides disagree: every
+  descriptor xcheckfs keeps is counted, and an operation first reserves the
+  most it can create. One that does not fit under `RLIMIT_NOFILE` fails with
+  `EMFILE` on both sides before either runs it (status `fd_refusals`,
+  `fd_budget`), instead of succeeding on the primary and failing on the
+  secondary. A refusal reads the limit again, so one changed with `prlimit`
+  after mount applies.
 - A write by a user who does not own a set-uid / set-gid file failed with
   `EPERM` when xcheckfs ran as root: the kernel's mode change that drops those
   bits ran with the writer's credentials (pjdfstest `chmod/12`).

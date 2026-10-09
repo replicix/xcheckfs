@@ -110,6 +110,9 @@ pub struct EngineConfig {
     pub direct_io: DirectIo,
     /// Number of lock stripes (rounded up to a power of two).
     pub lock_stripes: usize,
+    /// FUSE worker threads: each holds a cloned FUSE device descriptor,
+    /// outside the descriptor accounting (`engine::fds`).
+    pub fuse_threads: usize,
     pub serialize: Serialization,
     /// Where secondary objects are copied before resync overwrites or
     /// removes them. `None`: report only.
@@ -136,6 +139,7 @@ impl Default for EngineConfig {
             entry_ttl: Duration::from_secs(1),
             direct_io: DirectIo::Auto,
             lock_stripes: 65536,
+            fuse_threads: 16,
             serialize: Serialization::Relaxed,
             quarantine: None,
             quarantine_cap: 64 << 20,

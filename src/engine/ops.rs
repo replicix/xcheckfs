@@ -7,6 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
+use super::fds::CountedFd;
 use super::node::Inserted;
 use super::{Attr, Ctx, Cx, Engine, Fail, LockSet, Node, OpResult, OpenDir, OpenFile, ROOT_ID, SetAttr, Side, cname};
 use crate::backend::{Backend, DirEntry, Lock, StatFs, TimeSpec, XattrOut};
@@ -596,7 +597,12 @@ impl Engine {
     fn install_file(&self, n: Arc<Node>, pfd: OwnedFd, sfd: Option<OwnedFd>, flags: i32) -> u64 {
         let fh = self.alloc_fh();
         self.nodes.opened(&n);
-        self.files.insert(fh, Arc::new(OpenFile { sec_gen: n.sec_gen(), node: n, pfd, sfd, flags, written: AtomicBool::new(false) }));
+        self.files.insert(fh, Arc::new(OpenFile {
+            sec_gen: n.sec_gen(),
+            node: n,
+            pfd: CountedFd::new(pfd),
+            sfd: sfd.map(CountedFd::new),
+            flags, written: AtomicBool::new(false) }));
         self.stats.open_files.fetch_add(1, Relaxed);
         fh
     }
@@ -1202,7 +1208,12 @@ impl Engine {
             let sfd = s.and_then(|r| r.ok());
             let fh = self.alloc_fh();
             self.nodes.opened(&n);
-            self.dirs.insert(fh, Arc::new(OpenDir { sec_gen: n.sec_gen(), node: n, pfd, sfd, entries: parking_lot::Mutex::new(None) }));
+            self.dirs.insert(fh, Arc::new(OpenDir {
+                sec_gen: n.sec_gen(),
+                node: n,
+                pfd: CountedFd::new(pfd),
+                sfd: sfd.map(CountedFd::new),
+                entries: parking_lot::Mutex::new(None) }));
             self.stats.open_dirs.fetch_add(1, Relaxed);
             Ok(fh)
         })

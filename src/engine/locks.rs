@@ -32,8 +32,8 @@ use crate::sys::{self, SysResult};
 pub type LockReply = Box<dyn FnOnce(Result<(), i32>) + Send>;
 
 struct OwnerFds {
-    p: OwnedFd,
-    s: Option<OwnedFd>,
+    p: super::fds::CountedFd,
+    s: Option<super::fds::CountedFd>,
     /// The FUSE file handle the owner first locked through. OFD lock owners
     /// are bound to one handle; the kernel sends no unlock for them on
     /// close, only RELEASE of that handle.
@@ -225,7 +225,11 @@ impl Engine {
             };
             let p = open(Side::Primary)?;
             let s = if n.has_sec() && !self.detached() { open(Side::Secondary).ok() } else { None };
-            e.insert(OwnerFds { p, s, fh });
+            e.insert(OwnerFds {
+                p: super::fds::CountedFd::new(p),
+                s: s.map(super::fds::CountedFd::new),
+                fh,
+            });
         }
         Ok(&st.owners[&owner])
     }

@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+use super::fds::CountedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
@@ -19,7 +21,7 @@ pub struct Node {
     /// primary's inode number, with the root mapped to 1).
     pub id: u64,
     pub kind: FileKind,
-    pub pfd: OwnedFd,
+    pub pfd: CountedFd,
     pub pident: (u64, u64),
     /// The secondary object. `None` when it does not exist on the secondary
     /// (it diverged): operations on the node then only use the primary.
@@ -30,7 +32,7 @@ pub struct Node {
     /// an older secondary object stop using it.
     sec_gen: AtomicU64,
     /// The last secondary object removed by `set_secondary(None)`.
-    retired: Mutex<Option<Arc<OwnedFd>>>,
+    retired: Mutex<Option<Arc<CountedFd>>>,
     nlookup: AtomicU64,
     open: AtomicU64,
     /// Display path, maintained on lookup/create/rename. May be stale for
@@ -59,10 +61,10 @@ impl Node {
         Node {
             id,
             kind,
-            pfd,
+            pfd: CountedFd::new(pfd),
             pident,
             sec: RwLock::new(match (sfd, sident) {
-                (Some(fd), Some(ident)) => Some(SecRef { fd: Arc::new(fd), ident }),
+                (Some(fd), Some(ident)) => Some(SecRef { fd: Arc::new(CountedFd::new(fd)), ident }),
                 _ => None,
             }),
             sec_gen: AtomicU64::new(0),
@@ -133,18 +135,18 @@ impl Node {
     }
 }
 
-fn dev_null() -> Arc<OwnedFd> {
-    static NULL: std::sync::OnceLock<Arc<OwnedFd>> = std::sync::OnceLock::new();
+fn dev_null() -> Arc<CountedFd> {
+    static NULL: std::sync::OnceLock<Arc<CountedFd>> = std::sync::OnceLock::new();
     NULL.get_or_init(|| {
-        Arc::new(OwnedFd::from(
+        Arc::new(CountedFd::new(OwnedFd::from(
             std::fs::File::open("/dev/null").expect("/dev/null must exist"),
-        ))
+        )))
     })
     .clone()
 }
 
 struct SecRef {
-    fd: Arc<OwnedFd>,
+    fd: Arc<CountedFd>,
     ident: (u64, u64),
 }
 
@@ -152,7 +154,7 @@ struct SecRef {
 /// ownership for the (replaceable) secondary.
 pub enum SideFd<'a> {
     Borrowed(BorrowedFd<'a>),
-    Owned(Arc<OwnedFd>),
+    Owned(Arc<CountedFd>),
 }
 
 impl AsFd for SideFd<'_> {
@@ -278,7 +280,7 @@ impl NodeTable {
             if g.by_id.get(&n.id).is_some_and(|x| std::ptr::eq(&**x, n)) {
                 g.by_sec.insert(ident, n.id);
             }
-            *sec = Some(SecRef { fd: Arc::new(fd), ident });
+            *sec = Some(SecRef { fd: Arc::new(CountedFd::new(fd)), ident });
         }
         n.sec_gen.fetch_add(1, SeqCst);
     }

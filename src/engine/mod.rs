@@ -42,6 +42,7 @@ pub mod node;
 pub mod probe;
 pub mod ranges;
 mod ops;
+pub mod fds;
 mod pair;
 mod resync;
 
@@ -129,8 +130,8 @@ pub struct OpenFile {
     pub node: Arc<Node>,
     /// The node's secondary generation when the handle was opened.
     pub sec_gen: u64,
-    pub pfd: std::os::fd::OwnedFd,
-    pub sfd: Option<std::os::fd::OwnedFd>,
+    pub pfd: fds::CountedFd,
+    pub sfd: Option<fds::CountedFd>,
     pub flags: i32,
     pub written: std::sync::atomic::AtomicBool,
 }
@@ -141,8 +142,8 @@ pub type DirSnapEntry = (Vec<u8>, u64, FileKind);
 pub struct OpenDir {
     pub node: Arc<Node>,
     pub sec_gen: u64,
-    pub pfd: std::os::fd::OwnedFd,
-    pub sfd: Option<std::os::fd::OwnedFd>,
+    pub pfd: fds::CountedFd,
+    pub sfd: Option<fds::CountedFd>,
     /// Snapshot taken at offset 0: (name, ino, kind), "." and ".." first.
     pub entries: Mutex<Option<Arc<Vec<DirSnapEntry>>>>,
 }
@@ -253,6 +254,7 @@ pub struct Engine {
     repairs: resync::Repairs,
     quarantine_seq: AtomicU64,
     fd_reserve: FdReserve,
+    fd_budget: fds::FdBudget,
     /// Shadow of granted record locks and blocked requests (deadlock detection).
     pub(crate) lock_graph: Mutex<locks::WaitGraph>,
     /// How the engine adapts to legitimate differences of the two file systems (mount-time probe).
@@ -296,6 +298,11 @@ impl Engine {
         let sst = secondary.stat(std::os::fd::AsFd::as_fd(&sfd)).map_err(|e| anyhow::anyhow!("{e}"))?;
         let primary_root = sys::fd_path(std::os::fd::AsFd::as_fd(&pfd)).unwrap_or_default();
         let n = cfg.lock_stripes.max(16).next_power_of_two();
+        // What the descriptor accounting does not see: what is open now
+        // (stdio, the log, the two roots, the reserve), each FUSE thread's
+        // device clone, and room for the rest (the control socket, libraries).
+        let fd_budget = fds::FdBudget::new(fds::open_now() + 2 * cfg.fuse_threads as i64 + 256);
+        stats.fd_budget.store(fd_budget.budget().max(0) as u64, Relaxed);
         let use_creds = cfg.creds && sys::is_root();
         // btrfs always reports a link count of 1 for directories: comparing
         // directory link counts against it only produces noise. (The probe
@@ -349,6 +356,7 @@ impl Engine {
             repairs: resync::Repairs::default(),
             quarantine_seq: AtomicU64::new(0),
             fd_reserve: FdReserve::new(),
+            fd_budget,
             lock_graph: Mutex::new(locks::WaitGraph::default()),
             adapt,
             adaptations,
@@ -914,17 +922,33 @@ impl Engine {
         let inflight = want_events.then(|| self.stats.inflight.begin(op, ino, detail.clone()));
         let mut cx = self.cx(op);
         TOUCHED.with(|t| t.borrow_mut().clear());
-        let res = loop {
-            match body(&mut cx) {
-                Err(Fail::Retry) => continue,
-                Err(Fail::Errno(e)) => break Err(e),
-                Ok(v) => break Ok(v),
+        // The descriptors the operation may create, reserved before either side runs it: refused, it fails
+        // with EMFILE on both (see `fds`).
+        let fds = self.fd_budget.reserve(fds_needed(op));
+        let res = match &fds {
+            None => {
+                self.fd_reserve.warn_once();
+                self.stats.fd_refusals.fetch_add(1, Relaxed);
+                Err(libc::EMFILE)
             }
+            Some(_) => loop {
+                match body(&mut cx) {
+                    Err(Fail::Retry) => continue,
+                    Err(Fail::Errno(e)) => break Err(e),
+                    Ok(v) => break Ok(v),
+                }
+            },
         };
+        drop(fds);
         // Repairs run with their own locks, after the operation released its
-        // locks; the primary's result is returned unchanged.
+        // locks; the primary's result is returned unchanged. And with their
+        // own descriptors: a repair that cannot have them waits for the next
+        // one the object needs.
         for (r, why) in std::mem::take(&mut cx.resync) {
-            self.resync(r, &why);
+            match self.fd_budget.reserve(REPAIR_FDS) {
+                Some(_fds) => self.resync(r, &why),
+                None => tracing::warn!("not enough file descriptors to repair ({why}); left for a later repair"),
+            }
         }
         let total = t0.elapsed().as_nanos() as u64;
         if !is_read_only(op) && cx.window_ns > self.cfg.time_tolerance.as_nanos() as u64 / 10 {
@@ -1084,4 +1108,20 @@ pub(crate) fn is_read_only(op: OpKind) -> bool {
 
 pub(crate) fn cname(name: &OsStr) -> OpResult<CString> {
     Ok(sys::cstr(name.as_bytes())?)
+}
+
+/// Descriptors a repair may hold at once.
+const REPAIR_FDS: i64 = 16;
+
+/// The most descriptors an operation can create (and hold, for a node or a
+/// handle) while it runs. None for those that only free them (refusing a
+/// release for want of descriptors would be absurd) or use a handle's own.
+fn fds_needed(op: OpKind) -> i64 {
+    use OpKind::*;
+    match op {
+        Forget | Release | Releasedir | Flush | Read | Write | Fsync | Fsyncdir => 0,
+        Create | Rename | Unlink | Rmdir => 6,
+        Lookup | Mknod | Mkdir | Symlink | Link | Open | Opendir | Setattr | Getlk | Setlk => 4,
+        _ => 2,
+    }
 }

@@ -81,6 +81,9 @@ letters `c`, `r`, `s`, `e`, `d` are accepted for `continue`, `retry`,
 | `secondary_skipped` | operations whose secondary half was skipped because the object does not exist on the secondary |
 | `verifications` | read-backs and content/listing comparisons done at `thorough`/`paranoid` |
 | `concurrent_data_ops` | in-place writing operations (`write`, `fallocate`, `copy_file_range` destination; [relaxed serialization](../explanation/DESIGN.md#concurrent-data-operations)) that started while another one on the same file was in flight; reads are not counted |
+| `fds_held` | file descriptors xcheckfs keeps beyond one operation (two per cached inode, open handle and lock owner) |
+| `fds_budget` | what those may add up to: the soft `RLIMIT_NOFILE` less a margin for the descriptors not counted |
+| `fd_refusals` | operations refused with `EMFILE` before either file system ran them, because the descriptors they may create did not fit in the budget (instead of one side succeeding and the other failing) |
 | `range_waits` | data operations (reads included) that had to wait for an overlapping byte range held or queued by another |
 | `attr_time_skipped` | attribute comparisons whose `mtime` and `ctime` were skipped because an in-place data operation overlapped the stat (the [racy-stat rule](checks.md#racy-stats)) |
 | `aligned_mtimes` | times the secondary's `mtime` was set to the primary's right after an operation that one of the file systems stamps and the other does not ([mount-time probe](fs-differences.md#the-mount-time-probe)) |

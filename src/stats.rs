@@ -191,6 +191,11 @@ pub struct Stats {
     pub concurrent_data_ops: AtomicU64,
     /// Data operations that waited for an overlapping byte range.
     pub range_waits: AtomicU64,
+    /// Operations refused with `EMFILE` before either side ran them: their
+    /// descriptors did not fit under the limit (`engine::fds`).
+    pub fd_refusals: AtomicU64,
+    /// What the counted descriptors may add up to (`engine::fds`).
+    pub fd_budget: AtomicU64,
     /// Stats whose mtime/ctime comparison was skipped because an in-place
     /// data operation on the object overlapped them.
     pub attr_time_skipped: AtomicU64,
@@ -229,6 +234,8 @@ impl Default for Stats {
             verifications: AtomicU64::new(0),
             concurrent_data_ops: AtomicU64::new(0),
             range_waits: AtomicU64::new(0),
+            fd_refusals: AtomicU64::new(0),
+            fd_budget: AtomicU64::new(0),
             attr_time_skipped: AtomicU64::new(0),
             resyncs: AtomicU64::new(0),
             aligned_mtimes: AtomicU64::new(0),
@@ -261,6 +268,8 @@ pub struct StatsSnapshot {
     pub verifications: u64,
     pub concurrent_data_ops: u64,
     pub range_waits: u64,
+    pub fd_refusals: u64,
+    pub fd_budget: u64,
     pub attr_time_skipped: u64,
     pub resyncs: u64,
     pub aligned_mtimes: u64,
@@ -320,6 +329,8 @@ impl Stats {
             verifications: l(&self.verifications),
             concurrent_data_ops: l(&self.concurrent_data_ops),
             range_waits: l(&self.range_waits),
+            fd_refusals: l(&self.fd_refusals),
+            fd_budget: l(&self.fd_budget),
             attr_time_skipped: l(&self.attr_time_skipped),
             resyncs: l(&self.resyncs),
             aligned_mtimes: l(&self.aligned_mtimes),
