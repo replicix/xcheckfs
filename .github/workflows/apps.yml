@@ -74,6 +74,13 @@ jobs:
 
       - name: Prepare
         run: |
+          # Docker Hub rate-limits anonymous pulls from shared runners; pull
+          # through Google's mirror of it (images it lacks still come from the Hub).
+          f=/etc/docker/daemon.json
+          { [ -s $f ] && sudo cat $f || echo '{}'; } | jq '. + {"registry-mirrors": ["https://mirror.gcr.io"]}' >/tmp/daemon.json
+          sudo mv /tmp/daemon.json $f
+          sudo systemctl restart docker
+          docker info --format '{{.RegistryConfig.Mirrors}}'
           chmod +x bin/xcheckfs
           mkdir -p "$OUT"
           bin/xcheckfs --version
