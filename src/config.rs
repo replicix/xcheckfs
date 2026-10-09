@@ -111,9 +111,6 @@ pub struct EngineConfig {
     /// Number of lock stripes (rounded up to a power of two).
     pub lock_stripes: usize,
     pub serialize: Serialization,
-    /// Threads running secondary halves, at least (and at least one per CPU); at least as many as there are
-    /// threads issuing operations, so that a secondary half never queues behind other operations' halves.
-    pub secondary_threads: usize,
     /// Where secondary objects are copied before resync overwrites or
     /// removes them. `None`: report only.
     pub quarantine: Option<std::path::PathBuf>,
@@ -140,7 +137,6 @@ impl Default for EngineConfig {
             direct_io: DirectIo::Auto,
             lock_stripes: 65536,
             serialize: Serialization::Relaxed,
-            secondary_threads: 16,
             quarantine: None,
             quarantine_cap: 64 << 20,
             resync_limit: 5,

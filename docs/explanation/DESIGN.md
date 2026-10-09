@@ -104,8 +104,8 @@ different orders), and a checker that cries wolf is useless.
   names up on the primary, locks, looks up again, and retries (bounded)
   until the mapping is the one it locked.
 - **Concurrent dual execution.** The two halves run at the same time (the
-  secondary on a worker pool, the primary on the calling thread), so an
-  operation costs the slower side, not the sum. `--sequential` runs the
+  secondary on a helper thread of the calling thread, the primary on the
+  calling thread), so an operation costs the slower side, not the sum. `--sequential` runs the
   secondary after the primary instead.
 
 ## What an operation does

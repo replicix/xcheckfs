@@ -129,6 +129,28 @@ impl WaitGraph {
         }
     }
 
+    /// Whether `l` is a lock some owner other than `asking` holds on `node`: one of that owner's runs of contiguous
+    /// ranges of `l`'s type, whole (a file system reports an owner's touching ranges of one type merged, as POSIX
+    /// keeps them).
+    pub(crate) fn holds_lock(&self, node: u64, asking: u64, l: &Lock) -> bool {
+        let want = range(l);
+        self.held.get(&node).is_some_and(|owners| {
+            owners.iter().filter(|(owner, _)| **owner != asking).any(|(_, list)| {
+                let mut ranges: Vec<(u64, u64)> =
+                    list.iter().filter(|(_, _, t)| *t == l.typ).map(|&(a, b, _)| (a, b)).collect();
+                ranges.sort_unstable();
+                let mut runs: Vec<(u64, u64)> = Vec::new();
+                for (a, b) in ranges {
+                    match runs.last_mut() {
+                        Some(last) if a <= last.1.saturating_add(1) => last.1 = last.1.max(b),
+                        _ => runs.push((a, b)),
+                    }
+                }
+                runs.contains(&want)
+            })
+        })
+    }
+
     fn drop_owner(&mut self, node: u64, owner: u64) {
         if let Some(o) = self.held.get_mut(&node) {
             o.remove(&owner);
@@ -219,7 +241,13 @@ impl Engine {
             Err(e) => return Ok(Err(e)),
         };
         let sec = !self.detached() && fds.s.is_some();
-        let (p, s) = self.both(cx, sec, None, |side, be| be.setlk(fds.fd(side).as_fd(), l));
+        let (p, mut s) = self.both(cx, sec, None, |side, be| be.setlk(fds.fd(side).as_fd(), l));
+        if p.is_ok() && s.as_ref().is_some_and(|s| matches!(s, Err(e) if conflict(*e))) {
+            s = Some(settle_secondary(
+                || self.b[1].setlk(fds.fd(Side::Secondary).as_fd(), l),
+                |r| r.is_ok(),
+            ));
+        }
         if p.is_ok() {
             self.lock_graph.lock().apply(n.id, owner, l);
         }
@@ -292,16 +320,32 @@ impl Engine {
                 }
             };
             let sec = !self.detached() && sfd.is_some();
-            let (p, s) = self.both(cx, sec, None, |side, be| {
+            let (p, mut s) = self.both(cx, sec, None, |side, be| {
                 be.getlk(if side == Side::Primary { pfd } else { sfd.unwrap() }, &l)
             });
+            let unlocked = |r: &SysResult<Lock>| matches!(r, Ok(x) if x.typ == libc::F_UNLCK);
+            if unlocked(&p) && s.as_ref().is_some_and(|s| matches!(s, Ok(x) if x.typ != libc::F_UNLCK)) {
+                s = Some(settle_secondary(|| self.b[1].getlk(sfd.unwrap(), &l), unlocked));
+            }
             self.cmp_result(cx, &n, None, &p, &s, false)?;
             let mut pl = p?;
-            if let Some(Ok(sl)) = s
-                && (pl.typ, pl.start, pl.len) != (sl.typ, sl.start, sl.len) {
+            // POSIX lets F_GETLK report any lock in the way, and a file system with a lock table of its own
+            // need not pick the one the kernel's list has first. So the two must agree on whether a lock is in
+            // the way, and the secondary's must be one: overlapping the range, with a conflicting type, and held
+            // (whole) by another owner as far as the locks mirrored to it go.
+            if let Some(Ok(sl)) = s {
+                let differ = match (pl.typ == libc::F_UNLCK, sl.typ == libc::F_UNLCK) {
+                    (true, true) => false,
+                    (false, false) => {
+                        !(lock_blocks(&sl, &l) && self.lock_graph.lock().holds_lock(n.id, owner, &sl))
+                    }
+                    _ => true,
+                };
+                if differ {
                     let d = |x: &Lock| format!("type {} {}+{}", x.typ, x.start, x.len);
                     self.report(cx, &n, MismatchKind::Lock, Some("getlk".into()), d(&pl), d(&sl), String::new(), false)?;
                 }
+            }
             drop(st);
             if pl.typ == libc::F_UNLCK {
                 pl.start = l.start;
@@ -456,5 +500,52 @@ impl Engine {
                 }
             }
         });
+    }
+}
+
+/// Whether `held` (a lock F_GETLK reported) is in the way of `want`: their ranges overlap (a length of 0 runs to the
+/// end of the file) and one of them is a write lock.
+fn lock_blocks(held: &Lock, want: &Lock) -> bool {
+    let end = |x: &Lock| if x.len == 0 { u64::MAX } else { x.start.saturating_add(x.len - 1) };
+    let wr = libc::F_WRLCK;
+    held.start <= end(want) && want.start <= end(held) && (held.typ == wr || want.typ == wr)
+}
+
+/// Retries a lock request the secondary alone found in the way, until `settled` or about a quarter of a second has
+/// passed, and returns the last answer. A lock xcheckfs itself released by closing an owner's descriptors (OFD locks:
+/// the kernel releases them with the description) is gone at once from a native file system, but a FUSE one (or NFS)
+/// learns of it later — FUSE sends its RELEASE asynchronously, after `close` returned — so a request right after can
+/// still meet it there. A real divergence outlasts the retries.
+fn settle_secondary<T>(mut again: impl FnMut() -> SysResult<T>, settled: impl Fn(&SysResult<T>) -> bool) -> SysResult<T> {
+    let mut wait = std::time::Duration::from_millis(1);
+    loop {
+        std::thread::sleep(wait);
+        let r = again();
+        if settled(&r) || wait >= std::time::Duration::from_millis(128) {
+            return r;
+        }
+        wait *= 2;
+    }
+}
+
+#[cfg(test)]
+mod getlk_tests {
+    use super::*;
+
+    fn lk(typ: i32, start: u64, len: u64) -> Lock {
+        Lock { typ, start, len, pid: 0 }
+    }
+
+    #[test]
+    fn a_reported_lock_must_overlap_and_conflict() {
+        let (rd, wr) = (libc::F_RDLCK, libc::F_WRLCK);
+        // A write request is blocked by any overlapping lock; a read request only by a write lock.
+        assert!(lock_blocks(&lk(rd, 10, 8), &lk(wr, 17, 4)));
+        assert!(!lock_blocks(&lk(rd, 10, 8), &lk(rd, 17, 4)));
+        assert!(lock_blocks(&lk(wr, 10, 8), &lk(rd, 17, 4)));
+        // Ranges: [10, 17] and [18, ...] do not overlap; a length of 0 runs to the end.
+        assert!(!lock_blocks(&lk(wr, 10, 8), &lk(wr, 18, 4)));
+        assert!(lock_blocks(&lk(wr, 100, 0), &lk(wr, 1 << 40, 1)));
+        assert!(lock_blocks(&lk(wr, 5, 1), &lk(wr, 0, 0)));
     }
 }

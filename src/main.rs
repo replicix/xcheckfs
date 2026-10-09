@@ -495,7 +495,6 @@ fn run_mount(
         direct_io: a.direct_io,
         serialize: a.serialize,
         lock_stripes: a.lock_stripes.clamp(16, 1 << 22),
-        secondary_threads: threads,
         quarantine: a.quarantine.clone(),
         quarantine_cap: a.quarantine_cap,
         resync_limit: a.resync_limit.max(1),

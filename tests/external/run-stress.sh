@@ -128,12 +128,14 @@ trap 'exit 130' INT TERM HUP
 
 # Aborts the FUSE connection of OUR mount (it frees processes stuck in uninterruptible sleep on it). Needs the
 # connection number recorded right after the mount came up.
+aborted=
 abort_conn() {
     [ -n "$minor" ] || return 0
     # Only while our mount is still the owner of that connection number (numbers are reused).
     awk -v m="$mnt" -v d="0:$minor" '$5 == m && $3 == d { f = 1 } END { exit !f }' /proc/self/mountinfo || return 0
     echo "!! aborting FUSE connection $minor" >&2
     echo 1 > "/sys/fs/fuse/connections/$minor/abort" 2>/dev/null || true
+    aborted=1
 }
 
 # bounded SECS CMD...: runs CMD with a time limit; on a timeout aborts the connection (the command may be blocked in
@@ -170,6 +172,13 @@ stage() {
     local name=$1 start end rc mb ma ops
     shift
     stage_no=$((stage_no + 1))
+    # After an abort the mount is gone: a stage would "pass" on whatever is left at the mount point.
+    if [ -n "$aborted" ]; then
+        echo "== [$stage_no] $name: SKIPPED (the FUSE connection was aborted)"
+        summary+=("$(printf '%-34s %-28s %7ss  mismatches %s' "$name" "SKIPPED(aborted)" "-" "?")")
+        failed=1
+        return 0
+    fi
     mb=$(mismatches_now)
     start=$(date +%s.%N)
     echo "== [$stage_no] $name"
@@ -181,7 +190,13 @@ stage() {
     local dur result=ok
     dur=$(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.1f", b - a }')
     if [ "$rc" != 0 ]; then result="FAILED($rc)"; failed=1; fi
-    if [ "$ma" != "$mb" ]; then result="$result MISMATCHES($mb->$ma)"; failed=1; fi
+    if [ "$ma" = "?" ]; then
+        result="$result NO-STATUS"
+        failed=1
+    elif [ "$ma" != "$mb" ]; then
+        result="$result MISMATCHES($mb->$ma)"
+        failed=1
+    fi
     echo "== [$stage_no] $name: $result in ${dur}s (ops so far ${ops:-?}, mismatches $ma)"
     summary+=("$(printf '%-34s %-28s %7ss  mismatches %s' "$name" "$result" "$dur" "$ma")")
     return 0

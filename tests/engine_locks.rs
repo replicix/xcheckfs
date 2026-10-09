@@ -265,6 +265,29 @@ fn getlk_faults_are_lock_mismatches() {
     h.assert_no_mismatches(); // (the pid is not compared: it is not meaningful across owners)
 }
 
+/// POSIX lets F_GETLK name any lock in the way: a secondary naming another owner's lock than the primary did is
+/// no mismatch, also when it reports that owner's touching locks merged; a fragment of one is.
+#[test]
+fn getlk_may_name_any_lock_in_the_way() {
+    for (lie, mismatch) in [
+        (Lock { typ: R, start: 20, len: 20, pid: 0 }, false), // C's lock (its two touching ones, merged), not A's
+        (Lock { typ: R, start: 20, len: 10, pid: 0 }, true),  // half of it
+        (Lock { typ: R, start: 20, len: 5, pid: 0 }, true),   // a fragment
+    ] {
+        let (h, ino, _fh) = setup(CheckLevel::Basic, MismatchMode::Log);
+        h.setlk(ino, A, R, 0, 30).unwrap();
+        h.setlk(ino, C, R, 20, 10).unwrap();
+        h.setlk(ino, C, R, 30, 10).unwrap();
+        h.fault.inject(FaultOp::Getlk, Effect::GetlkResult(lie));
+        assert_eq!(h.getlk(ino, B, W, 25, 2).unwrap().typ, R);
+        if mismatch {
+            h.expect_mismatch(K::Lock, Some("getlk"));
+        } else {
+            h.assert_no_mismatches();
+        }
+    }
+}
+
 /// A secondary that fails to wake a queued waiter's retry: the retry of a queued request is compared like any
 /// other attempt.
 #[test]

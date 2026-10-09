@@ -11,6 +11,7 @@
 #   XCHECKFS      xcheckfs binary (default: target/release|debug/xcheckfs of this repo, built if missing)
 #   CHECK         basic | thorough | paranoid (default thorough)
 #   TEST_ARGS     extra arguments for test_syscalls, e.g. "3 -17" (select/skip tests)
+#   UNLINKED_TEST 1: also run the open-but-unlinked tests (test_syscalls -u)
 #   KEEP          1: keep the work directory
 set -u -o pipefail
 
@@ -75,9 +76,12 @@ for _ in $(seq 1 150); do
 done
 mountpoint -q "$mnt" || die "mount did not appear within 15 s"
 
-# (The -u/:realdir tests modify the backing directory behind the mount's back, which by definition breaks the mirror:
-# they are not usable here.)
+# (The :realdir tests modify the backing directory behind the mount's back, which by definition breaks the mirror:
+# they are not usable here. -u, the open-but-unlinked tests, is: UNLINKED_TEST=1.)
 args=("$mnt")
+if [ "${UNLINKED_TEST:-0}" = 1 ]; then
+    args+=(-u)
+fi
 # shellcheck disable=SC2206
 args+=(${TEST_ARGS:-})
 echo "== test_syscalls ${args[*]} (check=$check)"

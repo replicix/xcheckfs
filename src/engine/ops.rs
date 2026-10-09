@@ -407,6 +407,19 @@ impl Engine {
             let creds = self.creds(ctx);
             let creds = creds.as_ref();
             if let Some(mode) = a.mode {
+                // The kernel's privilege drop on a write (`file_remove_privs`): a mode change that only clears
+                // set-uid / set-gid, sent with the writer's credentials. The writer need not own the file, so as
+                // the writer it failed (`EPERM`, and so did the write: pjdfstest chmod/12). With
+                // `default_permissions` the kernel has already decided any mode change that reaches us, so this
+                // one runs with our own credentials.
+                let kill_priv = a.uid.is_none()
+                    && a.gid.is_none()
+                    && self.b[0].stat(n.fd(Side::Primary).as_fd()).is_ok_and(|st| {
+                        let (cur, new) = (st.mode & 0o7777, mode & 0o7777);
+                        let cleared = cur & !new;
+                        new & !cur == 0 && cleared != 0 && cleared & !(libc::S_ISUID | libc::S_ISGID) == 0
+                    });
+                let creds = if kill_priv { None } else { creds };
                 let (p, s) = self.both(cx, sec, creds, |side, be| be.chmod(n.fd(side).as_fd(), n.kind, mode & 0o7777));
                 self.cmp_result(cx, &n, None, &p, &s, true)?;
                 p?;

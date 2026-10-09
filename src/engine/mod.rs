@@ -42,6 +42,7 @@ pub mod node;
 pub mod probe;
 pub mod ranges;
 mod ops;
+mod pair;
 mod resync;
 
 pub use node::Node;
@@ -244,7 +245,6 @@ pub struct Engine {
     root_ino: u64,
     root_dev: u64,
     primary_root: PathBuf,
-    pool: Option<rayon::ThreadPool>,
     use_creds: bool,
     groups: Mutex<HashMap<u32, (Instant, Vec<u32>)>>,
     bufs: BufPool,
@@ -296,24 +296,6 @@ impl Engine {
         let sst = secondary.stat(std::os::fd::AsFd::as_fd(&sfd)).map_err(|e| anyhow::anyhow!("{e}"))?;
         let primary_root = sys::fd_path(std::os::fd::AsFd::as_fd(&pfd)).unwrap_or_default();
         let n = cfg.lock_stripes.max(16).next_power_of_two();
-        let pool = if cfg.parallel {
-            Some(
-                rayon::ThreadPoolBuilder::new()
-                    .thread_name(|i| format!("xcheckfs-sec-{i}"))
-                    // at least one per FUSE worker: a secondary half must never
-                    // queue behind other operations' halves
-                    .num_threads(
-                        std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(4)
-                            .max(cfg.secondary_threads)
-                            .clamp(2, 128),
-                    )
-                    .build()?,
-            )
-        } else {
-            None
-        };
         let use_creds = cfg.creds && sys::is_root();
         // btrfs always reports a link count of 1 for directories: comparing
         // directory link counts against it only produces noise. (The probe
@@ -359,7 +341,6 @@ impl Engine {
             root_ino: pst.ino,
             root_dev: pst.dev,
             primary_root,
-            pool,
             use_creds,
             groups: Mutex::new(HashMap::new()),
             bufs: BufPool { bufs: Mutex::new(Vec::new()) },
@@ -584,14 +565,9 @@ impl Engine {
         };
         let (p, s) = if !sec {
             (run(Side::Primary), None)
-        } else if let Some(pool) = &self.pool {
-            let mut s = None;
-            let mut p = None;
-            pool.in_place_scope(|sc| {
-                sc.spawn(|_| s = Some(run(Side::Secondary)));
-                p = Some(run(Side::Primary));
-            });
-            (p.unwrap(), s)
+        } else if self.cfg.parallel {
+            let (p, s) = pair::join(|| run(Side::Primary), || run(Side::Secondary));
+            (p, Some(s))
         } else {
             let p = run(Side::Primary);
             (p, Some(run(Side::Secondary)))

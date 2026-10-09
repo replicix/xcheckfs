@@ -61,8 +61,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   file system that does not count subdirectories; the file system type check
   remains only as a fallback when the probe could not run.
 - `--threads` defaults to twice the number of CPUs, between 16 and 64 (was the
-  number of CPUs, at most 16). The pool running the secondary halves is at
-  least as large.
+  number of CPUs, at most 16).
+- The secondary half of an operation runs on a helper thread of the calling
+  thread, parked between operations, instead of on a rayon pool whose idle
+  workers spun looking for work: under a metadata-heavy load the mount used
+  465 CPU-seconds in 36 s (110 now) and wrote a quarter as fast.
 - `--direct-io` takes a value (`off`, `auto`, `all`) and defaults to `auto`;
   without a value it means `all`, as before. Shared writable `mmap` of files
   using direct I/O needs kernel 6.7 or newer.
@@ -75,6 +78,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   copy matches its source.
 
 ### Fixed
+
+- A write by a user who does not own a set-uid / set-gid file failed with
+  `EPERM` when xcheckfs ran as root: the kernel's mode change that drops those
+  bits ran with the writer's credentials (pjdfstest `chmod/12`).
+- `getlk` accepts any lock in the way that another owner holds, as POSIX
+  allows: a file system with its own lock table may name another one than the
+  kernel's list has first.
+- A lock request the secondary alone finds in the way is retried briefly
+  before it is a mismatch: a FUSE secondary learns of a released OFD lock only
+  from the asynchronous `RELEASE` after the descriptor's `close`.
+- `run-libfuse-syscalls.sh` honors `UNLINKED_TEST=1`, as documented; the stress
+  lane skips (and fails) the stages after it aborted a hung mount, which used to
+  report them as passed.
 
 - `xcheckfs verify` no longer reports directory link counts when either tree
   is on a file system that does not count subdirectories (btrfs), nor SELinux
