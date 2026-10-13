@@ -28,6 +28,7 @@
 #   STRESS_WORKERS   stress-ng workers per stressor (default 2)
 #   STRESS_CROSS_FS  1/0: force "the trees are on different file systems" (default: detected)
 #   MOUNT_OPTS       extra arguments for `xcheckfs mount` (e.g. "--threads 4 --direct-io")
+#   MOUNT_WAIT       seconds to wait for the mount to appear (default 60: a loaded host can take a while)
 #   KEEP             1: keep the work directory (also kept on failure when KEEP=failed)
 #
 # Exit status: 0 all good, 1 a step failed or xcheckfs recorded a mismatch or `verify` found a difference,
@@ -230,12 +231,12 @@ echo "== xcheckfs $bin; check=$check; primary $primary; secondary $secondary; mo
 # shellcheck disable=SC2086
 "$bin" mount --check "$check" --on-mismatch log --log-file "$log" --no-color $mount_extra "$mnt" "$primary" "$secondary" &
 pid=$!
-for _ in $(seq 1 150); do
+for _ in $(seq 1 $(( ${MOUNT_WAIT:-60} * 10 ))); do
     mountpoint -q "$mnt" && break
     kill -0 "$pid" 2>/dev/null || { cat "$log" 2>/dev/null; pid=; die "xcheckfs exited before the mount appeared"; }
     sleep 0.1
 done
-mountpoint -q "$mnt" || die "mount did not appear within 15 s"
+mountpoint -q "$mnt" || die "mount did not appear within ${MOUNT_WAIT:-60} s"
 dev=$(stat -c %d "$mnt") && minor=$(( (dev & 255) | ((dev >> 12) & 0xfff00) ))
 total_start=$(date +%s)
 
