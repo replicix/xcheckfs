@@ -37,7 +37,7 @@ fields match anything. Unknown fields are rejected.
 |---|---|---|
 | `op` | the operation | an operation name in lower case (`lookup`, `getattr`, `setattr`, `read`, `write`, `setxattr`, `copy_file_range`, ...) or `"*"` |
 | `kind` | the mismatch kind | `result attr data length readdir readlink xattr identity verify content lock` ([Checks](checks.md#mismatch-kinds)) |
-| `field` | the attribute, xattr, or verification step | e.g. `nlink`, `mtime`, `list`; only mismatches that have a field can match |
+| `field` | the attribute, xattr, or verification step | e.g. `nlink`, `mtime`, `list`; a `result` mismatch of `getxattr`, `setxattr` or `removexattr` has the extended attribute's name (`system.posix_acl_access`); only mismatches that have a field can match |
 | `path` | the path relative to the mount root | a glob, e.g. `/var/cache/**` |
 | `primary` | the primary's value | exact string, case-insensitive |
 | `secondary` | the secondary's value | exact string, case-insensitive |

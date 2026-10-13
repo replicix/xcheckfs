@@ -1334,7 +1334,7 @@ impl Engine {
             let sec = self.sec_for(&[&n]) && !policy_xattr(c.to_bytes());
             let creds = self.creds(ctx);
             let (p, s) = self.both(cx, sec, creds.as_ref(), |side, be| be.setxattr(n.fd(side).as_fd(), &c, value, flags));
-            self.cmp_result(cx, &n, None, &p, &s, true)?;
+            self.cmp_result_field(cx, &n, None, Some(name.to_string_lossy().into_owned()), &p, &s, true)?;
             p?;
             if self.thorough() && matches!(s, Some(Ok(()))) {
                 let (a, b) = self.both(cx, true, None, |side, be| be.getxattr(n.fd(side).as_fd(), &c, XATTR_MAX));
@@ -1357,7 +1357,7 @@ impl Engine {
             let _l = self.lock(&[(ino, false)]);
             let sec = self.sec_for(&[&n]) && !policy_xattr(c.to_bytes());
             let (p, s) = self.both(cx, sec, None, |side, be| be.getxattr(n.fd(side).as_fd(), &c, size as usize));
-            self.cmp_result(cx, &n, None, &p, &s, false)?;
+            self.cmp_result_field(cx, &n, None, Some(name.to_string_lossy().into_owned()), &p, &s, false)?;
             let pv = p?;
             if let Some(Ok(sv)) = &s
                 && &pv != sv {
@@ -1408,7 +1408,7 @@ impl Engine {
             let sec = self.sec_for(&[&n]) && !policy_xattr(c.to_bytes());
             let creds = self.creds(ctx);
             let (p, s) = self.both(cx, sec, creds.as_ref(), |side, be| be.removexattr(n.fd(side).as_fd(), &c));
-            self.cmp_result(cx, &n, None, &p, &s, true)?;
+            self.cmp_result_field(cx, &n, None, Some(name.to_string_lossy().into_owned()), &p, &s, true)?;
             p?;
             if self.thorough() && matches!(s, Some(Ok(()))) {
                 let (a, b) = self.both(cx, true, None, |side, be| be.getxattr(n.fd(side).as_fd(), &c, 0));

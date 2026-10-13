@@ -128,8 +128,16 @@ fn xattr_errno_on_secondary_is_a_result_mismatch() {
             FaultOp::Listxattr => ignore(h.listxattr("/f").unwrap()),
             _ => h.removexattr("/f", "user.k").unwrap(),
         }
-        let m = h.expect_mismatch(K::Result, None);
+        // the xattr an operation was about is the field (listxattr has none); the detail names the object's type
+        let field = match op {
+            FaultOp::Setxattr => Some("user.k2"),
+            FaultOp::Listxattr => None,
+            _ => Some("user.k"),
+        };
+        let m = h.expect_mismatch(K::Result, field);
         assert_eq!((m.primary.as_str(), m.secondary.as_str()), ("OK", "EIO"), "{op:?}");
+        assert_eq!(m.field.as_deref(), field, "{op:?}");
+        assert_eq!(m.detail, "on a file", "{op:?}");
     }
 }
 

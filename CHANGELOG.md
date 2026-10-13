@@ -68,6 +68,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- A `result` mismatch of `getxattr`, `setxattr` or `removexattr` names the
+  extended attribute as its field (in reports, deduplication and allow
+  rules), and every `result` mismatch on an object says its type ("on a
+  dir").
+
 - Directory link counts of a btrfs side are now found by the probe, for any
   file system that does not count subdirectories; the file system type check
   remains only as a fallback when the probe could not run.

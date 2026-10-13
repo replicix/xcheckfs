@@ -799,19 +799,37 @@ impl Engine {
         s: &Option<SysResult<T>>,
         excl: bool,
     ) -> OpResult<()> {
+        self.cmp_result_field(cx, node, name, None, p, s, excl)
+    }
+
+    /// `cmp_result` with a field for the mismatch: the extended attribute an xattr operation was about, so that
+    /// a report names it and an allow rule can match it. The detail names the object's type.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cmp_result_field<T>(
+        &self,
+        cx: &mut Cx,
+        node: &Arc<Node>,
+        name: Option<&OsStr>,
+        field: Option<String>,
+        p: &SysResult<T>,
+        s: &Option<SysResult<T>>,
+        excl: bool,
+    ) -> OpResult<()> {
         let Some(s) = s else { return Ok(()) };
         let pe = p.as_ref().err().copied().unwrap_or(0);
         let se = s.as_ref().err().copied().unwrap_or(0);
         if pe != se {
+            // (a name-based operation's object is the entry, not `node`, its parent)
+            let detail = if name.is_none() { format!("on a {}", node.kind.name()) } else { String::new() };
             self.report_at(
                 cx,
                 node,
                 name,
                 MismatchKind::Result,
-                None,
+                field,
                 sys::errno_name(pe).into(),
                 sys::errno_name(se).into(),
-                String::new(),
+                detail,
                 excl,
             )?;
         }
