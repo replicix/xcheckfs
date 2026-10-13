@@ -113,7 +113,14 @@ xcheckfs can only pass on the concurrency that reaches it
   that do not extend a file reach it concurrently.
 - Writes through a shared writable `mmap` reach xcheckfs through the
   kernel's writeback, later and in larger pieces than the application's
-  stores, at times it does not control.
+  stores, at times it does not control. The file systems stamp `mtime`
+  when the write reaches them, not at the store: after `store;
+  utimensat(T); munmap` both sides have the writeback's time, where a
+  local file system used directly keeps `T` (it stamps a store at its page
+  fault). Both sides agree, so this is no mismatch; it shows only when
+  results through xcheckfs (or through any FUSE file system without the
+  kernel's writeback cache) are compared with runs on a local file system.
+  An `msync` before the `utimensat` keeps `T` everywhere.
 - `FUSE_HANDLE_KILLPRIV_V2` is not enabled: the kernel itself clears the
   set-uid and set-gid bits of a file written by an unprivileged user, and
   xcheckfs sees that as a separate `setattr`. Writes to such files stay
