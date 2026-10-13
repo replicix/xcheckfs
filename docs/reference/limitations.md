@@ -14,6 +14,7 @@ in one place. Other pages link here instead of repeating it.
 - [Concurrency reaching the secondary](#concurrency-reaching-the-secondary)
 - [Not covered](#not-covered)
 - [Repair](#repair)
+- [Secondary-fault episodes](#secondary-fault-episodes)
 - [Resources](#resources)
 - [Freeze](#freeze)
 
@@ -66,6 +67,16 @@ Unsupported operations are counted in the statistics.
 
 - `fcntl` record locks are mirrored with non-blocking OFD locks and an
   xcheckfs-side queue ([Design](../explanation/DESIGN.md#lock-mirroring)).
+- **xcheckfs takes every client's locks on the secondary from its own
+  process**: one open file description per lock owner, locked with
+  `F_OFD_SETLK`. A file system that fences a lock owner's *process* after a
+  lost lock (for example a lease that lapsed while the file system stalled)
+  therefore fences xcheckfs as a whole, and fails every client's operations,
+  not just the lock owner's: expect a
+  [secondary-fault episode](../explanation/DESIGN.md#secondary-fault-episodes).
+  Give such a file system a lock lease well above the longest stall you
+  expect in the test environment (an overloaded host stalls for many
+  seconds).
 - **`FUSE_INTERRUPT` is not handled** by the FUSE library. For blocked
   `F_SETLKW` requests, the only ones xcheckfs keeps waiting, a watchdog
   checks the waiting thread for pending signals ten times a second and ends
@@ -165,12 +176,54 @@ How repair works: [Design](../explanation/DESIGN.md#repair-resync).
   while it was missing, continue on the primary only; the object itself is
   compared again by the next operation that looks at it (and repaired then).
 - Repairs that walk beyond the locked directory (link-count repairs, type
-  changes found on an object) do not lock what they walk: concurrent
-  operations may report transient extra mismatches, which are repaired in
-  turn.
+  changes found on an object, deferred repairs that find an object by its
+  path) do not lock what they walk: concurrent operations may report
+  transient extra mismatches (a parent directory's times), which are repaired
+  in turn. A repair by path whose path no longer leads to the object (an
+  ancestor was renamed meanwhile) fails instead of attaching the object to
+  another one; the object is compared and repaired again by the next
+  operation on it.
 - Because diverged objects are pushed back to the primary's state, a clean
   `verify` after a `resync` run says nothing about the secondary; the
   mismatch count does.
+- **Repairs wait while a secondary-fault episode is open**, and run when it
+  ends ([below](#secondary-fault-episodes)). Until then the diverged objects
+  stay diverged.
+
+## Secondary-fault episodes
+
+How episodes work: [Design](../explanation/DESIGN.md#secondary-fault-episodes).
+
+- **The burst is reported one by one.** The faults before an episode is
+  recognized (8 by default) are ordinary mismatches. In `resync` mode their
+  repairs go into the failing secondary and fail (`resync_failures`); they
+  are deferred again when the episode opens.
+- **What is tainted belongs to the episode while it is open.** A difference
+  met during the episode on an object or name that a mutation changed in it
+  is counted in the episode, also one unrelated to the outage (a wrong link
+  count of a directory the outage touched, say). After the episode, every
+  mismatch is reported; one that was counted in it is a repeat. The tables
+  are bounded (262 144 names and objects); beyond that, knock-ons are
+  reported one by one.
+- **Counted mismatches** are not in the per-operation error counts (the TUI's
+  operations table, `ctl stats`) nor in `ctl mismatches`; they are in the
+  episode (`ctl episodes`).
+- **In `log` mode**, the knock-ons of an episode that are met only after it
+  ended are reported one by one (nothing was repaired).
+- **A rename of a name that diverged** taints the source name, not the
+  target: a later mismatch on the target name is reported one by one.
+- **Deferred repairs are bounded** (16 384 objects and names, and an eighth
+  of the descriptor budget in objects). Beyond that, an object is repaired
+  when a mismatch on it asks again.
+- **An episode ends only when the secondary answers** a stat of its root
+  after the quiet period. A secondary that stays fenced keeps the episode
+  open until unmount; its deferred repairs then never run, which the log
+  and the summary say (run `verify`).
+- **Thresholds are a trade-off.** An outage under a light workload (fewer
+  than `--episode-errors` faults in 10 s) is reported one by one; a
+  secondary with very frequent defects of many objects (more than a quarter
+  of the operations) is treated as an outage. Change `--episode-errors`, or
+  switch episodes off with `--episode-errors 0`.
 
 ## Resources
 

@@ -2,7 +2,7 @@
 //! frozen mismatches without the TUI (background mode, CI, scripts).
 //!
 //! Protocol: one command per line, one JSON object per response line.
-//! Commands: `status`, `stats`, `mismatches [N]`, `pending`,
+//! Commands: `status`, `stats`, `mismatches [N]`, `episodes [N]`, `pending`,
 //! `resolve <id> <continue|retry|resync|fail|detach|allow|allow-path>`,
 //! `mode <resync|log|fail|freeze|detach>`, `detach`, `rules`.
 
@@ -112,6 +112,10 @@ fn status(sh: &Shared) -> Value {
         "mismatches": s.mismatches,
         "allowed": s.allowed,
         "repeats": s.repeats,
+        "episodes": s.episodes,
+        "episode_mismatches": s.episode_mismatches,
+        "episode": sh.policy.episodes().current().map(|e| episode_json(&e, false)),
+        "deferred_repairs": s.deferred_repairs,
         "pending": sh.policy.pending().len(),
         "secondary_skipped": s.secondary_skipped,
         "verifications": s.verifications,
@@ -133,6 +137,18 @@ fn status(sh: &Shared) -> Value {
         "fds_budget": s.fd_budget,
         "fd_refusals": s.fd_refusals,
     })
+}
+
+/// A secondary-fault episode; without its records for `status`.
+fn episode_json(e: &crate::episode::Episode, records: bool) -> Value {
+    let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        if !records {
+            o.remove("records");
+        }
+        o.insert("summary".into(), Value::String(e.describe()));
+    }
+    v
 }
 
 fn command(sh: &Shared, line: &str) -> Value {
@@ -163,6 +179,11 @@ fn command(sh: &Shared, line: &str) -> Value {
             let h = sh.policy.history();
             let v: Vec<Value> = h.iter().rev().take(n).map(|m| serde_json::to_value(&**m).unwrap_or(Value::Null)).collect();
             json!({"ok": true, "mismatches": v})
+        }
+        ["episodes", rest @ ..] => {
+            let n: usize = rest.first().and_then(|x| x.parse().ok()).unwrap_or(10);
+            let v: Vec<Value> = sh.policy.episodes().list(n).iter().map(|e| episode_json(e, true)).collect();
+            json!({"ok": true, "episodes": v})
         }
         ["pending"] => {
             let v: Vec<Value> = sh
@@ -237,8 +258,16 @@ pub fn summary(stats: &Stats) -> String {
     let mut ops: Vec<(OpKind, u64)> = s.ops.iter().filter(|(_, o)| o.count > 0).map(|(k, o)| (*k, o.count)).collect();
     ops.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
     let top: Vec<String> = ops.iter().take(8).map(|(k, c)| format!("{}={c}", k.name())).collect();
+    let mut episodes = if s.episodes > 0 {
+        format!(", {} secondary-fault episodes ({} mismatches counted in them)", s.episodes, s.episode_mismatches)
+    } else {
+        String::new()
+    };
+    if s.deferred_repairs > 0 {
+        episodes += &format!(", {} deferred repairs not run yet", s.deferred_repairs);
+    }
     format!(
-        "{} ops in {:.0}s ({}), {} mismatches ({} allowed, {} repeats), {} repairs ({} failed, {} given up), read {}, written {}, {} verifications, {} secondary halves skipped",
+        "{} ops in {:.0}s ({}), {} mismatches ({} allowed, {} repeats){episodes}, {} repairs ({} failed, {} given up), read {}, written {}, {} verifications, {} secondary halves skipped",
         s.total_ops(),
         s.uptime_secs,
         top.join(" "),

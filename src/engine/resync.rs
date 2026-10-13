@@ -19,6 +19,10 @@
 //! minutes, is given up: the object stays diverged and is handled on the
 //! primary only. With `--quarantine DIR`, the secondary's version is copied
 //! there before it is overwritten or removed.
+//!
+//! While a secondary-fault episode is open (`crate::episode`: the secondary
+//! is failing as a whole) repairs are deferred: they would fail, and leave
+//! the objects diverged and primary-only. They run when it ends.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -27,7 +31,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::Mutex;
@@ -52,6 +56,50 @@ pub(crate) enum ResyncReq {
 impl ResyncReq {
     pub(crate) fn entry(d: &Arc<Node>, name: &OsStr) -> ResyncReq {
         ResyncReq::Entry(d.clone(), vec![name.to_os_string()])
+    }
+
+    /// What a deferred request is merged by: the kind of repair and the node.
+    fn key(&self) -> (u8, u64) {
+        match self {
+            ResyncReq::Object(n) => (0, n.id),
+            ResyncReq::Entry(d, _) => (1, d.id),
+            ResyncReq::Dir(d) => (2, d.id),
+        }
+    }
+
+    /// Objects and names it repairs.
+    fn size(&self) -> usize {
+        match self {
+            ResyncReq::Entry(_, names) => names.len(),
+            _ => 1,
+        }
+    }
+
+    /// Whether `o` repairs nothing this one does not.
+    fn covers(&self, o: &ResyncReq) -> bool {
+        match (self, o) {
+            (ResyncReq::Entry(a, xs), ResyncReq::Entry(b, ys)) => a.id == b.id && ys.iter().all(|y| xs.contains(y)),
+            _ => self.key() == o.key(),
+        }
+    }
+
+    /// Splits a request for many names into requests of at most `n` names (a repair locks all of its names at once).
+    fn split(self, n: usize) -> Vec<ResyncReq> {
+        match self {
+            ResyncReq::Entry(d, names) if names.len() > n => {
+                names.chunks(n).map(|c| ResyncReq::Entry(d.clone(), c.to_vec())).collect()
+            }
+            r => vec![r],
+        }
+    }
+
+    /// A copy (the nodes are shared).
+    fn clone_req(&self) -> ResyncReq {
+        match self {
+            ResyncReq::Object(n) => ResyncReq::Object(n.clone()),
+            ResyncReq::Entry(d, names) => ResyncReq::Entry(d.clone(), names.clone()),
+            ResyncReq::Dir(d) => ResyncReq::Dir(d.clone()),
+        }
     }
 
     /// Whether `o` is already covered by this request; names of the same directory are added to it.
@@ -112,8 +160,79 @@ impl Repairs {
     }
 }
 
-fn e(what: &str, err: i32) -> String {
-    format!("{what}: {}", fmt_errno(err))
+/// Repairs held back while a secondary-fault episode is open, merged per object like the repairs of one operation.
+/// Bounded: a repair that does not fit is dropped (the episode counts it), and the object is repaired when a
+/// mismatch on it asks again.
+#[derive(Default)]
+pub(crate) struct Deferred {
+    st: Mutex<DeferredState>,
+    /// Objects and names of deferred repairs that are running.
+    running: AtomicU64,
+}
+
+#[derive(Default)]
+struct DeferredState {
+    reqs: Vec<(ResyncReq, String)>,
+    /// `ResyncReq::key` -> index in `reqs`.
+    index: HashMap<(u8, u64), usize>,
+    /// Objects and names queued.
+    items: usize,
+    /// Repairs dropped since the queue was last run (the first is logged).
+    dropped: u64,
+    /// Repairs that failed with a secondary fault lately (the faults of a burst, before it was known to be an
+    /// episode): deferred too when the episode opens.
+    failed: VecDeque<(Instant, ResyncReq, String)>,
+}
+
+/// Objects and names the deferred repairs may cover; the nodes they hold (and their descriptors) are bounded by the
+/// descriptor budget as well.
+const DEFER_CAP: usize = 16_384;
+/// Names repaired at once when the deferred repairs run.
+const DEFER_CHUNK: usize = 64;
+
+fn e(what: &str, err: i32) -> RepairError {
+    RepairError { msg: format!("{what}: {}", fmt_errno(err)), errno: Some(err) }
+}
+
+/// Why a repair failed, and the errno of the call that failed when one did (a repair the secondary failed with a fault
+/// may be part of a secondary-fault episode).
+#[derive(Debug)]
+pub(crate) struct RepairError {
+    msg: String,
+    errno: Option<i32>,
+}
+
+impl RepairError {
+    /// The same failure, said to be about `what`.
+    fn at(self, what: impl std::fmt::Display) -> RepairError {
+        RepairError { msg: format!("{what}: {}", self.msg), errno: self.errno }
+    }
+
+    /// Several failures as one: the messages, and the first errno.
+    fn join(v: Vec<RepairError>) -> RepairError {
+        RepairError {
+            errno: v.iter().find_map(|x| x.errno),
+            msg: v.iter().map(|x| x.msg.as_str()).collect::<Vec<_>>().join("; "),
+        }
+    }
+}
+
+impl From<String> for RepairError {
+    fn from(msg: String) -> RepairError {
+        RepairError { msg, errno: None }
+    }
+}
+
+impl From<&str> for RepairError {
+    fn from(msg: &str) -> RepairError {
+        RepairError { msg: msg.to_string(), errno: None }
+    }
+}
+
+impl std::fmt::Display for RepairError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
 }
 
 fn cname(n: &OsStr) -> Result<CString, String> {
@@ -131,7 +250,22 @@ impl Engine {
 
     /// Runs one queued repair. `why` is the mismatch that caused it.
     pub(crate) fn resync(&self, req: ResyncReq, why: &str) {
+        self.resync_req(req, why, false);
+    }
+
+    /// `deferred`: a repair deferred during a secondary-fault episode. Its object may have lost its secondary
+    /// meanwhile (a failed repair detaches it), and is then found again by its path (`repair_by_path`). That changes
+    /// the secondary's parent directory without holding the parent's stripe: a concurrent `getattr` or `readdir` of
+    /// the parent can see a transient difference (its times) until `restore_dir_times`, as with the other repairs that
+    /// walk beyond what they lock (docs/reference/limitations.md, Repair).
+    fn resync_req(&self, req: ResyncReq, why: &str, deferred: bool) {
         if self.detached() {
+            return;
+        }
+        // Not into a secondary that fails as a whole: when the episode ends.
+        if self.policy.episodes().is_open() {
+            self.requeue_failed();
+            self.defer(req, why);
             return;
         }
         let key = match &req {
@@ -155,22 +289,34 @@ impl Engine {
         let res = match &req {
             // A directory's own state includes its entries (link count, size).
             // (unless the secondary object is not a directory at all: then the entry is replaced)
-            ResyncReq::Object(n) if n.kind == FileKind::Dir && self.secondary_is_dir(n) => self.repair_entries(n, None, why),
+            ResyncReq::Object(n) if n.kind == FileKind::Dir && self.secondary_is_dir(n) => {
+                self.repair_entries(n, None, why).map(|()| true)
+            }
             ResyncReq::Object(n) => {
                 let mut dirs = Vec::new();
-                let r = self.repair_object(n, &key, why, &mut dirs);
+                let r = self.repair_object(n, &key, why, &mut dirs, deferred);
                 self.restore_dir_times(dirs);
                 r
             }
-            ResyncReq::Entry(d, names) => self.repair_entries(d, Some(names.clone()), why),
-            ResyncReq::Dir(d) => self.repair_entries(d, None, why),
+            ResyncReq::Entry(d, names) => self.repair_entries(d, Some(names.clone()), why).map(|()| true),
+            ResyncReq::Dir(d) => self.repair_entries(d, None, why).map(|()| true),
         };
         match res {
-            Ok(()) => {
+            Ok(true) => {
                 self.stats.resyncs.fetch_add(1, Relaxed);
                 tracing::warn!("{key}: secondary repaired from the primary");
             }
+            Ok(false) => tracing::debug!("{key}: nothing to repair (the object has no secondary)"),
             Err(err) => {
+                // (a repair the secondary failed with a fault may be the start of an episode: it is deferred with
+                // the episode's repairs, should one open)
+                if self.policy.episodes().config().errors > 0 && err.errno.is_some_and(crate::episode::is_fault) {
+                    let mut d = self.deferred.st.lock();
+                    if d.failed.len() >= self.policy.episodes().config().errors as usize {
+                        d.failed.pop_front();
+                    }
+                    d.failed.push_back((Instant::now(), req.clone_req(), why.to_string()));
+                }
                 self.stats.resync_failures.fetch_add(1, Relaxed);
                 let what = match &req {
                     ResyncReq::Object(_) => "object",
@@ -180,6 +326,135 @@ impl Engine {
                 tracing::error!("{key}: {what} repair FAILED ({err}); it stays diverged");
             }
         }
+    }
+
+    /// Defers the repairs that failed with a secondary fault in the episode's window (before it was known).
+    fn requeue_failed(&self) {
+        let failed: Vec<_> = {
+            let mut d = self.deferred.st.lock();
+            if d.failed.is_empty() {
+                return;
+            }
+            d.failed.drain(..).collect()
+        };
+        for (at, req, why) in failed {
+            if at.elapsed() <= crate::episode::WINDOW {
+                self.defer(req, &why);
+            }
+        }
+    }
+
+    /// The deferred repairs queued and running (`deferred_repairs`).
+    fn deferred_gauge(&self, items: usize) {
+        self.stats.deferred_repairs.store(items as u64 + self.deferred.running.load(Relaxed), Relaxed);
+    }
+
+    /// Holds a repair back until the secondary-fault episode ends.
+    fn defer(&self, req: ResyncReq, why: &str) {
+        let mut d = self.deferred.st.lock();
+        let k = req.key();
+        let known = d.index.get(&k).copied();
+        if known.is_some_and(|i| d.reqs[i].0.covers(&req)) {
+            return;
+        }
+        let nodes = (self.fd_budget.budget() / 8).clamp(64, DEFER_CAP as i64) as usize;
+        if d.items >= DEFER_CAP || (known.is_none() && d.reqs.len() >= nodes) {
+            d.dropped += 1;
+            if d.dropped == 1 {
+                tracing::error!(
+                    "{} repairs are waiting for the secondary-fault episode to end: further ones are not queued \
+                     (first: {why}); those objects are repaired when a mismatch on them asks again",
+                    d.items
+                );
+            }
+            drop(d);
+            self.policy.episodes().deferred(true);
+            return;
+        }
+        match known {
+            Some(i) => {
+                let before = d.reqs[i].0.size();
+                d.reqs[i].0.absorb(&req);
+                d.items += d.reqs[i].0.size() - before;
+            }
+            None => {
+                let i = d.reqs.len();
+                d.index.insert(k, i);
+                d.items += req.size();
+                d.reqs.push((req, why.to_string()));
+            }
+        }
+        self.deferred_gauge(d.items);
+        drop(d);
+        self.policy.episodes().deferred(false);
+    }
+
+    /// Runs the repairs deferred during a secondary-fault episode (which has ended), each with its own locks and
+    /// descriptors like the repairs at the end of an operation. Should another episode open meanwhile, the rest is
+    /// deferred again.
+    pub(crate) fn run_deferred(&self) {
+        let (reqs, items) = {
+            let mut d = self.deferred.st.lock();
+            let items = std::mem::take(&mut d.items);
+            d.index.clear();
+            d.dropped = 0;
+            self.deferred.running.fetch_add(items as u64, Relaxed);
+            (std::mem::take(&mut d.reqs), items)
+        };
+        if reqs.is_empty() {
+            return;
+        }
+        let done = |n: usize| {
+            self.deferred.running.fetch_sub(n as u64, Relaxed);
+            self.deferred_gauge(self.deferred.st.lock().items);
+        };
+        if self.detached() {
+            tracing::warn!("{} repairs deferred during the secondary-fault episode are dropped: the secondary is detached", reqs.len());
+            done(items);
+            return;
+        }
+        tracing::warn!("running {} repairs deferred during the secondary-fault episode", reqs.len());
+        for (req, why) in reqs {
+            for r in req.split(DEFER_CHUNK) {
+                let n = r.size();
+                match self.fd_budget.reserve(super::REPAIR_FDS) {
+                    Some(_fds) => self.resync_req(r, &why, true),
+                    None => tracing::warn!("not enough file descriptors to repair ({why}); left for a later repair"),
+                }
+                done(n);
+            }
+        }
+    }
+
+    /// Whether the secondary answers (a stat of its root): an episode ends only then.
+    fn secondary_answers(&self) -> bool {
+        let Some(root) = self.nodes.get(super::ROOT_ID) else { return true };
+        match root.try_s() {
+            Some(fd) => self.s().stat(fd.as_fd()).is_ok(),
+            None => true,
+        }
+    }
+
+    /// Ends a secondary-fault episode that has been quiet long enough, once the secondary answers again, and then
+    /// runs the repairs deferred during it. Called by the episode watcher (`spawn_episode_watch`).
+    pub fn episode_tick(&self) {
+        self.policy.episode_tick(|| self.secondary_answers());
+        if !self.policy.episodes().is_open() && !self.deferred.st.lock().reqs.is_empty() {
+            self.run_deferred();
+        }
+    }
+
+    /// Starts the thread that ends secondary-fault episodes and runs the repairs deferred during them.
+    pub fn spawn_episode_watch(engine: &Arc<Engine>) {
+        let weak = Arc::downgrade(engine);
+        let every = (engine.policy.episodes().config().quiet / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let _ = std::thread::Builder::new().name("xcheckfs-episodes".into()).spawn(move || {
+            loop {
+                std::thread::sleep(every);
+                let Some(e) = weak.upgrade() else { return };
+                e.episode_tick();
+            }
+        });
     }
 
     // ------------------------------------------------------------- object
@@ -197,12 +472,19 @@ impl Engine {
     /// `dirs` collects the directories whose names the repair changed on the secondary (their times then differ
     /// from the primary's: [`Engine::restore_dir_times`] makes them equal again, after the object's lock is
     /// released).
-    fn repair_object(&self, n: &Arc<Node>, path: &str, why: &str, dirs: &mut DirPairs) -> Result<(), String> {
+    ///
+    /// Ok(false): there was nothing to repair, the object has no secondary (any more): unless `reattach` (a repair
+    /// deferred during a secondary-fault episode, whose object a failed repair may have detached meanwhile), when it is
+    /// repaired by its path and reattached.
+    fn repair_object(&self, n: &Arc<Node>, path: &str, why: &str, dirs: &mut DirPairs, reattach: bool) -> Result<bool, RepairError> {
         let _l = self.lock(&[(n.id, true)]);
-        if !n.has_sec() {
-            return Ok(());
-        }
-        let Some(mut sfd) = n.try_s() else { return Ok(()) };
+        let Some(mut sfd) = n.try_s() else {
+            return if reattach && !path.ends_with(" (deleted)") {
+                self.repair_by_path(n, path, why, dirs).map(|()| true)
+            } else {
+                Ok(false)
+            };
+        };
         let pst = self.p().stat(n.p()).map_err(|x| e("stat primary", x))?;
         let mut sst = self.s().stat(sfd.as_fd()).map_err(|x| e("stat secondary", x))?;
         let wrong_target = pst.kind() == FileKind::Symlink
@@ -211,7 +493,7 @@ impl Engine {
         if pst.kind() != sst.kind() || wrong_target {
             // Cannot be fixed in place: replace the directory entry.
             drop(sfd);
-            return self.repair_by_path(n, path, why, dirs);
+            return self.repair_by_path(n, path, why, dirs).map(|()| true);
         }
         if pst.kind() != FileKind::Dir && pst.nlink != sst.nlink {
             // The link count is the symptom of a different hard-link structure: it cannot be fixed on the object,
@@ -230,13 +512,13 @@ impl Engine {
         if res.is_err() {
             self.nodes.set_secondary(n, None);
         }
-        res
+        res.map(|()| true)
     }
 
     /// Makes the names of the non-directory `n` (whose link count differs between the file systems) the same on
     /// both: every name the primary has for the inode (found by a bounded breadth-first walk of both trees from the
     /// root, in lockstep) must lead to one secondary inode, and no other secondary name may lead to it.
-    fn repair_links(&self, n: &Arc<Node>, pst: &Stat, path: &str, why: &str, changed: &mut DirPairs) -> Result<(), String> {
+    fn repair_links(&self, n: &Arc<Node>, pst: &Stat, path: &str, why: &str, changed: &mut DirPairs) -> Result<(), RepairError> {
         const MAX_ENTRIES: usize = 20_000;
         let (p, s) = (self.p(), self.s());
         let root = self.nodes.get(super::ROOT_ID).ok_or("no root")?;
@@ -251,7 +533,7 @@ impl Engine {
             for ent in self.list(p, pd.as_fd())? {
                 seen += 1;
                 if seen > MAX_ENTRIES {
-                    return Err(format!("more than {MAX_ENTRIES} entries to search"));
+                    return Err(format!("more than {MAX_ENTRIES} entries to search").into());
                 }
                 let Ok(c) = CString::new(ent.name) else { continue };
                 if ent.ino == pst.ino {
@@ -288,7 +570,7 @@ impl Engine {
             match s.stat_at(sd.as_fd(), c) {
                 Ok(st) if st.ident() == tst.ident() => continue,
                 Ok(st) if st.kind() == FileKind::Dir => {
-                    errors.push(format!("{name}: a directory on the secondary"));
+                    errors.push(format!("{name}: a directory on the secondary").into());
                     continue;
                 }
                 Ok(_) => {
@@ -331,7 +613,7 @@ impl Engine {
             self.nodes.set_secondary(n, Some((tfd, tst.ident())));
         }
         tracing::debug!("{path}: hard links of {} repaired ({} names)", n.id, names.len());
-        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+        if errors.is_empty() { Ok(()) } else { Err(RepairError::join(errors)) }
     }
 
     /// Path (relative to the mount root, "/" for the root itself) of a primary directory descriptor.
@@ -348,7 +630,7 @@ impl Engine {
 
     /// Replaces the secondary entry of `n` found by its current path (for
     /// type and link-target differences, which cannot be repaired in place).
-    fn repair_by_path(&self, n: &Arc<Node>, path: &str, why: &str, dirs: &mut DirPairs) -> Result<(), String> {
+    fn repair_by_path(&self, n: &Arc<Node>, path: &str, why: &str, dirs: &mut DirPairs) -> Result<(), RepairError> {
         if path.ends_with(" (deleted)") {
             self.nodes.set_secondary(n, None);
             return Err("the object has no name on the primary any more".into());
@@ -368,9 +650,18 @@ impl Engine {
         let pdir = walk(self.p()).map_err(|x| e("primary parent", x))?;
         let sdir = walk(self.s()).map_err(|x| e("secondary parent", x))?;
         let c = cname(name)?;
+        // The ancestors are not locked: a rename of one (or an exchange) since the path was resolved can make the path
+        // lead to another object of the same kind, and `n` must not be attached to that object's secondary.
+        let leads_to_n = || self.p().stat_at(pdir.as_fd(), &c).is_ok_and(|st| st.ident() == n.pident);
+        if !leads_to_n() {
+            return Err("the path no longer leads to the object".into());
+        }
         let mut cc = CopyCtx { links: HashMap::new(), scope: (pdir.as_fd(), sdir.as_fd()) };
         let res = self.repair_entry(pdir.as_fd(), sdir.as_fd(), &c, path, why, &mut cc);
         drop(cc);
+        if !leads_to_n() {
+            return Err("the path no longer leads to the object".into());
+        }
         match self.s().lookup(sdir.as_fd(), &c) {
             Ok((fd, st)) if st.kind() == n.kind => self.nodes.set_secondary(n, Some((fd, st.ident()))),
             _ => self.nodes.set_secondary(n, None),
@@ -402,7 +693,7 @@ impl Engine {
 
     // ------------------------------------------------------------ entries
 
-    fn repair_entries(&self, dir: &Arc<Node>, names: Option<Vec<OsString>>, why: &str) -> Result<(), String> {
+    fn repair_entries(&self, dir: &Arc<Node>, names: Option<Vec<OsString>>, why: &str) -> Result<(), RepairError> {
         let partial = names.is_some();
         if !dir.has_sec() {
             return Err("the directory itself is missing on the secondary".into());
@@ -430,7 +721,7 @@ impl Engine {
         for c in &names {
             let path = self.child_path(dir, OsStr::from_bytes(c.as_bytes()));
             if let Err(x) = self.repair_entry(dir.p(), sdir.as_fd(), c, &path, why, &mut cc) {
-                errors.push(format!("{path}: {x}"));
+                errors.push(x.at(&path));
             }
         }
         // The directory's own attributes (the repairs also changed its times
@@ -445,16 +736,16 @@ impl Engine {
         }
         for c in &names {
             if let Err(x) = self.verify_entry(dir.p(), sdir.as_fd(), c) {
-                errors.push(format!("{}: {x}", String::from_utf8_lossy(c.as_bytes())));
+                errors.push(x.at(String::from_utf8_lossy(c.as_bytes())));
             }
         }
         // (only the named entries were repaired: other names of the directory may legitimately still differ, which
         // shows in its listing and link count; those have their own mismatches and repairs)
         let dir_check = if partial { self.verify_dir_attrs(dir.p(), sdir.as_fd()) } else { self.verify_objects(dir.p(), sdir.as_fd(), FileKind::Dir) };
         if let Err(x) = dir_check {
-            errors.push(format!("the directory: {x}"));
+            errors.push(x.at("the directory"));
         }
-        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+        if errors.is_empty() { Ok(()) } else { Err(RepairError::join(errors)) }
     }
 
     /// Points the node known for the primary object `pdir/name` at the secondary object now found at `sdir/name`
@@ -497,7 +788,7 @@ impl Engine {
         path: &str,
         why: &str,
         cc: &mut CopyCtx<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RepairError> {
         let pst = self.p().stat_at(pdir, name).ok();
         let sst = self.s().stat_at(sdir, name).ok();
         match (pst, sst) {
@@ -539,7 +830,7 @@ impl Engine {
         be.lookup(dir, name).ok().and_then(|(fd, _)| be.readlink(fd.as_fd()).ok())
     }
 
-    fn list(&self, be: &dyn Backend, node: BorrowedFd<'_>) -> Result<Vec<crate::backend::DirEntry>, String> {
+    fn list(&self, be: &dyn Backend, node: BorrowedFd<'_>) -> Result<Vec<crate::backend::DirEntry>, RepairError> {
         let d = be.opendir(node).map_err(|x| e("opendir", x))?;
         be.readdir(d.as_fd()).map_err(|x| e("readdir", x))
     }
@@ -583,7 +874,7 @@ impl Engine {
         sdir: BorrowedFd<'_>,
         name: &CStr,
         cc: &mut CopyCtx<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RepairError> {
         let links = &mut cc.links;
         let (p, s) = (self.p(), self.s());
         let (pfd, pst) = p.lookup(pdir, name).map_err(|x| e("lookup primary", x))?;
@@ -667,7 +958,7 @@ impl Engine {
     }
 
     /// Removes `sdir/name` from the secondary, recursively.
-    fn remove_tree(&self, sdir: BorrowedFd<'_>, name: &CStr) -> Result<(), String> {
+    fn remove_tree(&self, sdir: BorrowedFd<'_>, name: &CStr) -> Result<(), RepairError> {
         let s = self.s();
         let st = s.stat_at(sdir, name).map_err(|x| e("stat", x))?;
         if st.kind() == FileKind::Dir {
@@ -685,7 +976,7 @@ impl Engine {
     // -------------------------------------------------------------- state
 
     /// Content (regular files) and attributes of one object.
-    fn copy_state(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>, pst: &Stat) -> Result<(), String> {
+    fn copy_state(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>, pst: &Stat) -> Result<(), RepairError> {
         if pst.kind() == FileKind::Regular {
             self.copy_content(pfd, sfd, pst.size)?;
         }
@@ -694,7 +985,7 @@ impl Engine {
     }
 
     /// Rewrites only the chunks that differ, then fixes the size.
-    fn copy_content(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>, size: u64) -> Result<(), String> {
+    fn copy_content(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>, size: u64) -> Result<(), RepairError> {
         let (p, s) = (self.p(), self.s());
         let pf = p.open(pfd, libc::O_RDONLY).map_err(|x| e("open primary", x))?;
         // A read-only file (mode 0444, say) cannot be opened for writing by its owner without CAP_DAC_OVERRIDE:
@@ -736,7 +1027,7 @@ impl Engine {
         sf: BorrowedFd<'_>,
         sfd: BorrowedFd<'_>,
         size: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), RepairError> {
         // Only ranges holding data on either side need looking at (sparse
         // files); everything else is a hole on both sides.
         let ssize = s.stat(sf).map(|st| st.size).unwrap_or(0);
@@ -804,13 +1095,13 @@ impl Engine {
 
     // ------------------------------------------------------- verification
 
-    fn verify_objects(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>, kind: FileKind) -> Result<(), String> {
+    fn verify_objects(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>, kind: FileKind) -> Result<(), RepairError> {
         let pst = self.p().stat(pfd).map_err(|x| e("stat primary", x))?;
         let sst = self.s().stat(sfd).map_err(|x| e("stat secondary", x))?;
         let diffs = compare::diff_stat(&pst, &sst, &self.attr_rules);
         if !diffs.is_empty() {
             let d: Vec<String> = diffs.iter().map(|d| format!("{} {} vs {}", d.field, d.primary, d.secondary)).collect();
-            return Err(format!("still differs: {}", d.join(", ")));
+            return Err(format!("still differs: {}", d.join(", ")).into());
         }
         match kind {
             FileKind::Regular => self.compare_files(pfd, sfd)?,
@@ -822,7 +1113,7 @@ impl Engine {
             FileKind::Dir => {
                 let d = compare::diff_dir(&self.list(self.p(), pfd)?, &self.list(self.s(), sfd)?);
                 if !d.is_empty() {
-                    return Err(format!("listing still differs: {}", d.describe(5)));
+                    return Err(format!("listing still differs: {}", d.describe(5)).into());
                 }
             }
             _ => {}
@@ -840,18 +1131,18 @@ impl Engine {
     }
 
     /// A directory's own attributes, without its link count and listing.
-    fn verify_dir_attrs(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>) -> Result<(), String> {
+    fn verify_dir_attrs(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>) -> Result<(), RepairError> {
         let pst = self.p().stat(pfd).map_err(|x| e("stat primary", x))?;
         let sst = self.s().stat(sfd).map_err(|x| e("stat secondary", x))?;
         let diffs: Vec<_> = compare::diff_stat(&pst, &sst, &self.attr_rules).into_iter().filter(|d| d.field != "nlink").collect();
         if !diffs.is_empty() {
             let d: Vec<String> = diffs.iter().map(|d| format!("{} {} vs {}", d.field, d.primary, d.secondary)).collect();
-            return Err(format!("still differs: {}", d.join(", ")));
+            return Err(format!("still differs: {}", d.join(", ")).into());
         }
         Ok(())
     }
 
-    fn verify_entry(&self, pdir: BorrowedFd<'_>, sdir: BorrowedFd<'_>, name: &CStr) -> Result<(), String> {
+    fn verify_entry(&self, pdir: BorrowedFd<'_>, sdir: BorrowedFd<'_>, name: &CStr) -> Result<(), RepairError> {
         let pl = self.p().lookup(pdir, name).ok();
         let sl = self.s().lookup(sdir, name).ok();
         match (pl, sl) {
@@ -871,13 +1162,13 @@ impl Engine {
         }
     }
 
-    fn compare_files(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>) -> Result<(), String> {
+    fn compare_files(&self, pfd: BorrowedFd<'_>, sfd: BorrowedFd<'_>) -> Result<(), RepairError> {
         let pf = self.p().open(pfd, libc::O_RDONLY).map_err(|x| e("open primary", x))?;
         let sf = self.s().open(sfd, libc::O_RDONLY).map_err(|x| e("open secondary", x))?;
         let (ps, ss) = (self.p().stat(pf.as_fd()), self.s().stat(sf.as_fd()));
         let (Ok(ps), Ok(ss)) = (ps, ss) else { return Err("stat error while verifying".into()) };
         if ps.size != ss.size {
-            return Err(format!("size still differs: {} vs {}", ps.size, ss.size));
+            return Err(format!("size still differs: {} vs {}", ps.size, ss.size).into());
         }
         let mut a = self.bufs.get(CHUNK);
         let mut b = self.bufs.get(CHUNK);
@@ -889,11 +1180,11 @@ impl Engine {
                 let (Ok(k), Ok(j)) =
                     (self.p().pread(pf.as_fd(), &mut a[..want], off), self.s().pread(sf.as_fd(), &mut b[..want], off))
                 else {
-                    res = Err("read error while verifying".to_string());
+                    res = Err("read error while verifying".into());
                     break 'ranges;
                 };
                 if let Some(d) = compare::diff_data(off, &a[..k], &b[..j]) {
-                    res = Err(format!("content still differs: {d}"));
+                    res = Err(format!("content still differs: {d}").into());
                     break 'ranges;
                 }
                 if k == 0 {
@@ -957,13 +1248,13 @@ impl Engine {
         let note = |notes: &mut Vec<String>, m: String| notes.push(format!("{}: {m}", dest.display()));
         match st.kind() {
             FileKind::Regular => {
-                let r = s.open(sfd, libc::O_RDONLY).map_err(|x| e("open", x)).and_then(|f| {
+                let r = s.open(sfd, libc::O_RDONLY).map_err(|x| e("open", x).to_string()).and_then(|f| {
                     let mut out = std::fs::File::create(dest).map_err(|x| x.to_string())?;
                     let mut buf = vec![0u8; CHUNK];
                     let mut off = 0u64;
                     while *budget > 0 {
                         let want = (CHUNK as u64).min(*budget) as usize;
-                        let k = s.pread(f.as_fd(), &mut buf[..want], off).map_err(|x| e("read", x))?;
+                        let k = s.pread(f.as_fd(), &mut buf[..want], off).map_err(|x| e("read", x).to_string())?;
                         if k == 0 {
                             return Ok(());
                         }
@@ -987,7 +1278,7 @@ impl Engine {
                 }
                 let ents = match self.list(s, sfd) {
                     Ok(v) => v,
-                    Err(x) => return note(notes, x),
+                    Err(x) => return note(notes, x.to_string()),
                 };
                 for ent in ents {
                     if *budget == 0 {
@@ -1005,14 +1296,14 @@ impl Engine {
                         note(notes, x.to_string());
                     }
                 }
-                Err(x) => note(notes, e("readlink", x)),
+                Err(x) => note(notes, e("readlink", x).to_string()),
             },
             k => note(notes, format!("{} mode {:o} rdev {:#x} not copied", k.name(), st.mode, st.rdev)),
         }
     }
 }
 
-fn write_all(s: &dyn Backend, fd: BorrowedFd<'_>, mut data: &[u8], mut off: u64) -> Result<(), String> {
+fn write_all(s: &dyn Backend, fd: BorrowedFd<'_>, mut data: &[u8], mut off: u64) -> Result<(), RepairError> {
     while !data.is_empty() {
         let w = s.pwrite(fd, data, off).map_err(|x| e("write secondary", x))?;
         if w == 0 {

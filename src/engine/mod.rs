@@ -8,7 +8,8 @@
 //! 3. runs the operation on the primary and the secondary (concurrently by
 //!    default),
 //! 4. compares the results while still holding the locks, optionally reads
-//!    the effect back (thorough mode), and reports mismatches to the policy,
+//!    the effect back (thorough mode), and reports mismatches to the policy
+//!    (which may count them in a secondary-fault episode, `crate::episode`),
 //! 5. returns the primary's result.
 //!
 //! Because conflicting operations hold the same stripe locks while both file
@@ -252,6 +253,8 @@ pub struct Engine {
     attr_rules: AttrRules,
     slack: Slack,
     repairs: resync::Repairs,
+    /// Repairs held back while a secondary-fault episode is open.
+    deferred: resync::Deferred,
     quarantine_seq: AtomicU64,
     fd_reserve: FdReserve,
     fd_budget: fds::FdBudget,
@@ -354,6 +357,7 @@ impl Engine {
             attr_rules,
             slack: Slack::default(),
             repairs: resync::Repairs::default(),
+            deferred: resync::Deferred::default(),
             quarantine_seq: AtomicU64::new(0),
             fd_reserve: FdReserve::new(),
             fd_budget,
@@ -772,6 +776,10 @@ impl Engine {
             detail,
             retryable: read_only,
             resyncable,
+            // (the secondary's result of the call compared last: for a `result` mismatch the one compared, for a
+            // read-back the read-back's)
+            fault: cx.sec_errno.filter(|&e| crate::episode::is_fault(e)),
+            entry: name.is_some(),
         };
         let reason = m.describe();
         match self.policy.report(m) {
@@ -819,6 +827,8 @@ impl Engine {
         let pe = p.as_ref().err().copied().unwrap_or(0);
         let se = s.as_ref().err().copied().unwrap_or(0);
         if pe != se {
+            // (what `report_at` tells a secondary fault by, whichever call this result came from)
+            cx.sec_errno = Some(se);
             // (a name-based operation's object is the entry, not `node`, its parent)
             let detail = if name.is_none() { format!("on a {}", node.kind.name()) } else { String::new() };
             self.report_at(

@@ -48,6 +48,9 @@ inside a tree is accepted with a warning, and new rules are not saved to it
 | `--quarantine DIR` | | Before a repair overwrites or removes the secondary's version of an object, copy it into a new directory under `DIR` ([layout](../explanation/DESIGN.md#quarantine)). Created if missing; must be outside the mirrored trees. Without it, repairs are only reported. |
 | `--quarantine-cap BYTES` | `67108864` (64 MiB) | Most bytes saved per quarantined object; more is truncated and noted in `mismatch.txt`. |
 | `--resync-limit N` | `5` | Repairs of one path within 10 minutes before resync gives up on it ([Design](../explanation/DESIGN.md#repair-limits-and-failures)). At least 1. |
+| `--on-secondary-fault log\|freeze\|detach` | `log` | What a [secondary-fault episode](../explanation/DESIGN.md#secondary-fault-episodes) does (the secondary failing as a whole: faults and their knock-on mismatches are counted in the episode, repairs wait until it ends). `log` reports it; `freeze` holds the operation that opened it, once for the whole episode; `detach` detaches the secondary. |
+| `--episode-errors N` | `8` | Secondary faults ([which errnos](../explanation/DESIGN.md#secondary-fault-episodes): `EIO`, `ENOSPC`, `EROFS`, `ENOTCONN`, `ESTALE`, ... where the primary answered otherwise) within 10 s that open an episode, when they are on at least 4 distinct objects and make up at least a quarter of the operations that ran on the secondary meanwhile. At least 4; `0` switches episodes off: every fault is reported as a mismatch. |
+| `--episode-quiet DUR` | `30s` | An episode ends after this long without a fault, once the secondary answers again (a stat of its root). |
 | `--rules FILE` | `/etc/xcheckfs/rules.toml` as root, else `$XDG_CONFIG_HOME/xcheckfs/rules.toml` (`~/.config/...`) | Allow-rules file ([Rules](rules.md)). A missing file means no rules. |
 | `--time-tolerance DUR` | `1s` | Allowed mtime difference, and minimum ctime movement that must be matched by the other side. Accepts `s`, `ms`, `us`, `ns` suffixes (e.g. `500ms`). |
 | `--no-dir-nlink` | off | Do not compare link counts of directories (some file systems always report 1). The [mount-time probe](fs-differences.md#the-mount-time-probe) finds such a file system by itself. |
@@ -117,7 +120,7 @@ and prints the JSON response. Without a command it sends `status`. Give the
 mount point (the same spelling as to `mount`) or `--socket PATH`.
 
 ```
-xcheckfs ctl MOUNTPOINT [status|stats|mismatches [N]|pending|resolve ID ACTION|mode MODE|detach|rules]
+xcheckfs ctl MOUNTPOINT [status|stats|mismatches [N]|episodes [N]|pending|resolve ID ACTION|mode MODE|detach|rules]
 xcheckfs ctl --socket PATH COMMAND...
 ```
 
@@ -125,8 +128,8 @@ xcheckfs ctl --socket PATH COMMAND...
 
 | Command | Code | Meaning |
 |---|---|---|
-| `mount` | 0 | Unmounted; no mismatch was recorded (allowed and repeated ones do not count). |
-| `mount` | 3 | Unmounted; at least one mismatch was recorded. |
+| `mount` | 0 | Unmounted; no mismatch and no secondary-fault episode was recorded (allowed and repeated mismatches do not count). |
+| `mount` | 3 | Unmounted; at least one mismatch or [secondary-fault episode](../explanation/DESIGN.md#secondary-fault-episodes) was recorded. |
 | `mount` | 1 | Startup failure or other error (message on stderr). With `--background` the exit status is that of the parent: 0 once mounted, 1 if the mount failed; the daemon's own status is not observable. |
 | `verify` | 0 | No differences, no errors. |
 | `verify` | 3 | At least one difference. |
@@ -143,7 +146,7 @@ subcommand.
 | Signal | Effect |
 |---|---|
 | `SIGINT`, `SIGTERM`, `SIGHUP` | Release frozen operations, unmount, print the summary, exit. |
-| `SIGUSR1` | Log a one-line summary (operations, mismatches, repairs, bytes, verifications). |
+| `SIGUSR1` | Log a one-line summary (operations, mismatches, secondary-fault episodes, repairs, bytes, verifications). |
 
 Unmount from outside with `fusermount3 -u MOUNTPOINT` (or `umount` as root).
 If the mount is busy because operations are frozen, release them first:
@@ -164,4 +167,8 @@ failed replies to `FUSE_INTERRUPT` for requests that already completed, which
 signal-heavy applications cause by the thousand, and its warnings about an
 already-gone mount at unmount are not logged). A mismatch is one log line at error level starting
 with `MISMATCH #ID`, naming the operation, kind, field, path, inode and both
-values.
+values. A [secondary-fault episode](../explanation/DESIGN.md#secondary-fault-episodes)
+is logged at error level when it opens
+(`SECONDARY FAULT EPISODE #N opened by mismatch #ID: ...`) and when it ends
+(`SECONDARY FAULT EPISODE #N ended (quiet|detached): ...`, with its counts),
+and at warn level every 10 s while it is open and counting.

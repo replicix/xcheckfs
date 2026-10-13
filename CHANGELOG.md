@@ -8,6 +8,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Secondary-fault episodes: the secondary failing as a whole (a burst of
+  `EIO`, `ENOSPC`, `EROFS`, `ENOTCONN`, `ESTALE`, ... where the primary
+  answered otherwise: by default 8 within 10 s, on at least 4 objects, at
+  least a quarter of the operations that ran on the secondary) is one
+  finding. While it is open, further faults and the knock-on mismatches of
+  what its mutations diverged are counted in the episode (per operation,
+  errno and kind, with examples verbatim) instead of being reported one by
+  one, and repairs, including the failed ones of the burst, are deferred
+  until it ends (30 s without a fault, once the secondary answers again),
+  then run and verified. Afterwards every mismatch is reported as usual (the
+  counted ones are in the deduplication table). The episode is logged at
+  error level, shown in the TUI header, listed by `ctl status` (`episodes`,
+  `episode_mismatches`, `episode`, `deferred_repairs`) and the new
+  `ctl episodes`, counted in the summary, and makes `mount` exit with 3 like
+  a mismatch; repairs deferred and not run by unmount are logged and in the
+  summary. `--on-secondary-fault log|freeze|detach` (default `log`) decides
+  what it does; `--episode-errors` (0: off) and `--episode-quiet` tune it. See
+  [Design](docs/explanation/DESIGN.md#secondary-fault-episodes). A stress run
+  in which the secondary fenced xcheckfs after a lost lock lease had reported
+  78 000 mismatches. Tests: `tests/engine_episode.rs`, `Harness::outage`
+  (the test harness has episodes off unless a test switches them on), and a
+  property that episodes lose no mismatch and change no result.
+- Documented that xcheckfs holds every client's locks on the secondary from
+  one process, so a file system that fences a lock owner's process fences
+  them all ([Limitations](docs/reference/limitations.md#locking)).
+
 - `--io-uring` serves FUSE over io_uring (Linux 6.14+, `fuse.enable_uring=Y`;
   falls back to `/dev/fuse` with a warning) with every request but lock
   waits, `fsync`, `fallocate` and copies dispatched on the ring threads:
@@ -95,6 +121,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A repair that replaces an object found by its path (an object of the wrong
+  type) no longer attaches the object to the secondary of another one when an
+  ancestor was renamed meanwhile: it fails, and the next operation on the
+  object compares and repairs it again.
 - SELinux labels (`security.selinux`) are no longer compared by the live
   `listxattr`/`getxattr` checks (`verify` already skipped them): the policy
   assigns them per mount, so a FUSE secondary on an SELinux host, which has

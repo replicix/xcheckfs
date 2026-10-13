@@ -181,6 +181,12 @@ pub struct Stats {
     pub allowed: AtomicU64,
     /// Repeats of an already reported mismatch on the same object.
     pub repeats: AtomicU64,
+    /// Secondary-fault episodes opened (`episode`).
+    pub episodes: AtomicU64,
+    /// Mismatches counted in an episode instead of being reported one by one.
+    pub episode_mismatches: AtomicU64,
+    /// Repairs waiting for the open episode to end.
+    pub deferred_repairs: AtomicU64,
     /// Operations where the secondary half was skipped (detached, or the
     /// object does not exist on the secondary any more).
     pub secondary_skipped: AtomicU64,
@@ -230,6 +236,9 @@ impl Default for Stats {
             mismatches: AtomicU64::new(0),
             allowed: AtomicU64::new(0),
             repeats: AtomicU64::new(0),
+            episodes: AtomicU64::new(0),
+            episode_mismatches: AtomicU64::new(0),
+            deferred_repairs: AtomicU64::new(0),
             secondary_skipped: AtomicU64::new(0),
             verifications: AtomicU64::new(0),
             concurrent_data_ops: AtomicU64::new(0),
@@ -264,6 +273,9 @@ pub struct StatsSnapshot {
     pub mismatches: u64,
     pub allowed: u64,
     pub repeats: u64,
+    pub episodes: u64,
+    pub episode_mismatches: u64,
+    pub deferred_repairs: u64,
     pub secondary_skipped: u64,
     pub verifications: u64,
     pub concurrent_data_ops: u64,
@@ -299,6 +311,10 @@ impl Stats {
     pub fn op(&self, k: OpKind) -> &OpStats {
         &self.ops[k as usize]
     }
+    /// Operations completed so far (without a snapshot's histograms).
+    pub fn ops_done(&self) -> u64 {
+        self.ops.iter().map(|o| o.count.load(Relaxed)).sum()
+    }
     pub fn snapshot(&self) -> StatsSnapshot {
         let l = |a: &AtomicU64| a.load(Relaxed);
         StatsSnapshot {
@@ -325,6 +341,9 @@ impl Stats {
             mismatches: l(&self.mismatches),
             allowed: l(&self.allowed),
             repeats: l(&self.repeats),
+            episodes: l(&self.episodes),
+            episode_mismatches: l(&self.episode_mismatches),
+            deferred_repairs: l(&self.deferred_repairs),
             secondary_skipped: l(&self.secondary_skipped),
             verifications: l(&self.verifications),
             concurrent_data_ops: l(&self.concurrent_data_ops),

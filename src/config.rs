@@ -86,6 +86,45 @@ impl MismatchMode {
     }
 }
 
+/// What a secondary-fault episode does (see `episode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum FaultMode {
+    /// Report the episode and count what it causes; the primary's results are returned.
+    Log,
+    /// Hold the operation that opened the episode, and every new one, until an operator decides.
+    Freeze,
+    /// Stop using the secondary; continue as a pass-through to the primary.
+    Detach,
+}
+
+impl FaultMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            FaultMode::Log => "log",
+            FaultMode::Freeze => "freeze",
+            FaultMode::Detach => "detach",
+        }
+    }
+}
+
+/// When a burst of secondary faults is one episode, and when it ends (see `episode`, which has the fixed parts).
+#[derive(Clone, Debug)]
+pub struct EpisodeConfig {
+    pub mode: FaultMode,
+    /// Secondary faults within `episode::WINDOW` that open an episode: 0 switches episodes off, otherwise at least
+    /// `episode::OBJECTS`.
+    pub errors: u32,
+    /// An episode ends after this long without a secondary fault, once the secondary answers again.
+    pub quiet: Duration,
+}
+
+impl Default for EpisodeConfig {
+    fn default() -> Self {
+        EpisodeConfig { mode: FaultMode::Log, errors: 8, quiet: Duration::from_secs(30) }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub check: CheckLevel,

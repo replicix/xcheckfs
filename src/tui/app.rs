@@ -87,6 +87,8 @@ pub struct App {
     pub pending: Vec<Arc<Mismatch>>,
     pub inflight: Vec<InFlightOp>,
     pub rules: usize,
+    /// The open secondary-fault episode: id and mismatches counted in it.
+    pub episode: Option<(u64, u64)>,
     /// Index into `pending` shown by the freeze modal.
     pub pend_sel: usize,
 
@@ -128,6 +130,7 @@ impl App {
             pending: Vec::new(),
             inflight: Vec::new(),
             rules: 0,
+            episode: None,
             pend_sel: 0,
             focus: Focus::OpLog,
             overlay: Overlay::None,
@@ -183,6 +186,10 @@ impl App {
                     true,
                 );
             }
+            UiEvent::Episode { id, open, text } => {
+                let what = if open { "opened" } else { "ended" };
+                self.set_status(format!("SECONDARY FAULT EPISODE #{id} {what}: {text}"), open);
+            }
             UiEvent::Log { level, message } => {
                 if self.logs_scroll.off > 0 {
                     self.logs_scroll.off = self.logs_scroll.off.saturating_add(1);
@@ -219,6 +226,7 @@ impl App {
         self.pend_sel = self.pend_sel.min(self.pending.len().saturating_sub(1));
         self.inflight = self.stats.inflight.snapshot();
         self.rules = self.policy.rules().len();
+        self.episode = self.policy.episodes().brief();
         if self.pending.is_empty() && matches!(self.overlay, Overlay::AllowChoice) {
             self.overlay = Overlay::None;
         }

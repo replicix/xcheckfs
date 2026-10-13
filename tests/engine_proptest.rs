@@ -639,6 +639,11 @@ fn harness(level: CheckLevel, mode: MismatchMode, parallel: bool) -> Env {
 }
 
 fn harness_ser(level: CheckLevel, mode: MismatchMode, parallel: bool, ser: Serialization) -> Env {
+    harness_full(level, mode, parallel, ser, 0)
+}
+
+/// `episode_errors`: secondary faults that open a secondary-fault episode (0: none, as in every other test here).
+fn harness_full(level: CheckLevel, mode: MismatchMode, parallel: bool, ser: Serialization, episode_errors: u32) -> Env {
     // `XCHECKFS_TEST_LOG=warn cargo test --test engine_proptest -- --nocapture` shows the engine's log
     if let Ok(f) = std::env::var("XCHECKFS_TEST_LOG") {
         let _ = tracing_subscriber::fmt().with_env_filter(f).with_test_writer().try_init();
@@ -649,6 +654,11 @@ fn harness_ser(level: CheckLevel, mode: MismatchMode, parallel: bool, ser: Seria
         .config(move |c| {
             c.parallel = parallel;
             c.serialize = ser;
+        })
+        // (an episode that never ends by itself: the runs are compared at the end)
+        .episodes(|e| {
+            e.errors = episode_errors;
+            e.quiet = Duration::from_secs(3600);
         })
         .build();
     h.mkdir("/d0");
@@ -1301,6 +1311,27 @@ fn check_resync(ops: &[Op], inj: &Inj, level: CheckLevel, par: bool, reference: 
     Ok(())
 }
 
+/// Secondary-fault episodes count what they do not report: the same faulted sequence finds as many mismatches with
+/// them (reported, repeated, or counted in an episode) as without, and gives the same results.
+fn check_episodes_count_everything(ops: &[Op], inj: &Inj, level: CheckLevel) -> Result<u64, TestCaseError> {
+    let all = |h: &Harness| {
+        h.stats.mismatches.load(Relaxed) + h.stats.repeats.load(Relaxed) + h.stats.episode_mismatches.load(Relaxed)
+    };
+    let run = |errors: u32| {
+        let h = harness_full(level, MismatchMode::Log, false, Serialization::Relaxed, errors);
+        h.inject(inj.fault());
+        let outs = run_ops(&h, ops);
+        observe(&h);
+        (outs, all(&h), h.stats.episodes.load(Relaxed), h)
+    };
+    let (off, n_off, _, _h_off) = run(0);
+    // (as few faults as can open an episode: the property is about what happens once one is open)
+    let (on, n_on, episodes, _h_on) = run(xcheckfs::episode::OBJECTS as u32);
+    first_difference(&off, &on, ops, "without vs with episodes")?;
+    prop_assert_eq!(n_off, n_on, "mismatches found without episodes vs reported, repeated or counted with them");
+    Ok(episodes)
+}
+
 // =================================================================================================================
 // The tests
 // =================================================================================================================
@@ -1396,6 +1427,15 @@ proptest! {
     ) {
         let r = reference_run(&ops, level, MismatchMode::Log, par);
         check_lie(&ops, lie.0, &lie.1, level, par, &r)?;
+    }
+
+    /// Secondary-fault episodes lose no mismatch and change no result.
+    #[test]
+    fn episodes_count_every_mismatch(
+        (inj, ops) in fault_and_ops(any_trigger()),
+        level in level_s(),
+    ) {
+        check_episodes_count_everything(&ops, &inj, level)?;
     }
 
     /// After a transient fault the secondary is repaired from the primary, which stays what it was.
@@ -1559,6 +1599,23 @@ fn every_mutating_fault_is_detected_on_the_canonical_workload() {
         }
     }
     assert!(failures.is_empty(), "{} faults:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// The episode property on the canonical workload, for every fault that fires on every call (an outage of one
+/// kind of call): it opens episodes there, which random sequences rarely do.
+#[test]
+fn episodes_count_every_mismatch_on_the_canonical_workload() {
+    let ops = canonical();
+    let (mut failures, mut episodes) = (Vec::new(), 0);
+    for (op, effect) in mutating_table().into_iter().filter(|(_, e)| matches!(e, Effect::Errno(_))) {
+        let inj = Inj { op, effect, trigger: Trigger::Always };
+        match check_episodes_count_everything(&ops, &inj, CheckLevel::Basic) {
+            Ok(n) => episodes += n,
+            Err(e) => failures.push(format!("{inj:?}: {e}")),
+        }
+    }
+    assert!(failures.is_empty(), "{} faults:\n{}", failures.len(), failures.join("\n"));
+    assert!(episodes > 0, "no fault opened an episode: the property was not exercised");
 }
 
 #[test]

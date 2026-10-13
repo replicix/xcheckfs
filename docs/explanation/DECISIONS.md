@@ -223,3 +223,58 @@ secondary's `mtime` is modified by xcheckfs (`utimens`, which also moves its
 ctime). A root that is not writable is not probed and nothing is adapted. The
 adaptation is limited to the exact situation, so a secondary that does not
 stamp `mtime` elsewhere is still reported.
+
+## ADR-14: A secondary outage is one finding (secondary-fault episodes)
+
+**Decision**: a burst of secondary faults (the secondary failing with an errno
+that says the file system is unwell, `EIO`, `ENOSPC`, `EROFS`, `ENOTCONN`,
+`ESTALE` and the like, where the primary answered otherwise: at least 8 within
+10 s, on at least 4 objects, at least a quarter of the operations that ran on
+the secondary meanwhile) opens an *episode*. While it is open, faults and the
+knock-on mismatches of what diverged in it are counted in it, with examples
+verbatim, instead of being reported one by one; repairs are deferred until it
+ends (30 s without a fault, once the secondary answers a probe), the failed
+repairs of the burst with them. Knock-ons are found by tainting what a
+*mutating* fault touched, *only while the episode is open*; afterwards every
+mismatch is reported as usual, and the counted ones are in the deduplication
+table. The episode is reported, fails the run like a mismatch, and
+`--on-secondary-fault log|freeze|detach` decides what it does
+([Design](DESIGN.md#secondary-fault-episodes)).
+**Why**: a stress run against an experimental distributed file system stalled
+its secondary for 18 s under host overload; a lock lease lapsed and the file
+system then failed every operation of the lock owner's process, which is
+xcheckfs's ([Lock mirroring](DESIGN.md#lock-mirroring)). About 30 000
+operations of all clients failed on the secondary only, and xcheckfs reported
+78 000 mismatches; in `resync` mode it would have fired tens of thousands of
+repairs into the failing secondary, each failing and leaving its object
+primary-only. One outage is one fact about the secondary; the flood buried
+it, and anything else that went wrong at the same time.
+**Rejected**:
+- Deduplicating harder (by operation and errno, without the object): it
+  would also merge real, independent defects that happen to share an errno,
+  and still report every knock-on.
+- Opening on errors alone, without the share of operations: a secondary
+  that fails one create in twenty has defects that must be reported and
+  repaired one by one, but would produce such a burst under a busy
+  workload, and have its repairs held back for as long as it keeps failing.
+- Ending an episode on the first success: a partial outage (a full file
+  system: reads work, writes fail) would be split into many episodes, with
+  repairs in between.
+- A taint that outlives the episode until a repair of the object verified
+  (the first version): a repair of a name does not prove its directory equal,
+  and `log` mode never repairs, so a later, independent defect of a tainted
+  object (a directory's mode changed behind xcheckfs's back, a corrupt read
+  of a file only stat'ed in the episode) was counted in an ended episode and
+  never reported. Deduplication already says which differences were seen.
+- Tainting what read-only operations failed on: they change nothing.
+- Hiding the episode's mismatches: they are counted per operation, errno and
+  kind, examples are kept, and the episode is itself a finding.
+- A flag for every threshold: the window, the objects, the share and the
+  records are fixed; the number of faults (0 switches episodes off) and the
+  quiet period are what a test environment may need to tune.
+**Consequence accepted**: the faults of the burst are reported one by one (the
+episode is not known yet). A defect of a tainted object that is unrelated to
+the outage, met while the episode is open, is counted in the episode, not
+reported on its own. In `log` mode the knock-ons met only after the episode
+are reported one by one. The deferred-repair queue is bounded; beyond it,
+objects are repaired when a mismatch on them asks again.

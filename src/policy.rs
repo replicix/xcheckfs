@@ -1,5 +1,5 @@
-//! What to do when the file systems disagree: allow rules, de-duplication,
-//! and the log / fail / freeze / detach modes.
+//! What to do when the file systems disagree: allow rules, secondary-fault
+//! episodes, de-duplication, and the log / fail / freeze / detach modes.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,8 @@ use globset::{Glob, GlobMatcher};
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
-use crate::config::MismatchMode;
+use crate::config::{EpisodeConfig, FaultMode, MismatchMode};
+use crate::episode::{Episode, Episodes, Seen};
 use crate::events::{EventSink, UiEvent};
 use crate::stats::{OpKind, Stats};
 
@@ -84,9 +85,16 @@ pub struct Mismatch {
     pub retryable: bool,
     /// The object can be re-synchronised from the primary to the secondary.
     pub resyncable: bool,
+    /// The secondary failed with this errno, one that says the file system is unwell, where the primary did not: a
+    /// secondary fault ([`crate::episode::is_fault`]).
+    #[serde(skip)]
+    pub fault: Option<i32>,
+    /// The mismatch is about a name in the directory `ino` (`path` names the entry).
+    #[serde(skip)]
+    pub entry: bool,
 }
 
-mod systime {
+pub(crate) mod systime {
     use std::time::{SystemTime, UNIX_EPOCH};
     pub fn serialize<S: serde::Serializer>(t: &SystemTime, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_f64(t.duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0))
@@ -306,6 +314,7 @@ pub struct Policy {
     next_id: AtomicU64,
     history: Mutex<VecDeque<Arc<Mismatch>>>,
     history_cap: usize,
+    episodes: Episodes,
     events: EventSink,
     stats: Arc<Stats>,
 }
@@ -333,9 +342,20 @@ impl Policy {
             next_id: AtomicU64::new(1),
             history: Mutex::new(VecDeque::new()),
             history_cap: 1000,
+            episodes: Episodes::new(EpisodeConfig::default()),
             events,
             stats,
         })
+    }
+
+    /// The same policy with secondary-fault episodes configured by `cfg`.
+    pub fn with_episodes(mut self, cfg: EpisodeConfig) -> Policy {
+        self.episodes = Episodes::new(cfg);
+        self
+    }
+
+    pub fn episodes(&self) -> &Episodes {
+        &self.episodes
     }
 
     pub fn mode(&self) -> MismatchMode {
@@ -421,8 +441,31 @@ impl Policy {
             return Verdict::Continue;
         }
         let mode = self.mode();
+        // A secondary fault during an episode, or a knock-on of one, is counted in the episode instead of being
+        // reported; a fault that completes a burst opens one (`episode`). Allowed mismatches never get here: an allow
+        // rule for, say, ENOSPC keeps them out of episodes too.
+        let opened = match if self.episodes.concerns(&m) { self.episodes.observe(&m, &self.stats) } else { Seen::No } {
+            Seen::No => None,
+            Seen::Counted => {
+                tracing::debug!("mismatch counted in a secondary-fault episode: {}", m.describe());
+                // (found again after the episode, it is a repeat, like any reported mismatch)
+                self.seen.lock().insert(seen_key(&m));
+                return match mode {
+                    MismatchMode::Fail => Verdict::Fail,
+                    // (deferred while the episode is open, see `Engine::resync`)
+                    MismatchMode::Resync if m.resyncable => Verdict::Resync,
+                    MismatchMode::Detach => {
+                        self.detach();
+                        Verdict::Continue
+                    }
+                    _ => Verdict::Continue,
+                };
+            }
+            Seen::Opened(ep) => Some(ep),
+        };
         let key = seen_key(&m);
-        if !self.seen.lock().insert(key) {
+        // (the fault that opens an episode is reported even when it repeats one: it is the episode's first report)
+        if !self.seen.lock().insert(key) && opened.is_none() {
             self.stats.repeats.fetch_add(1, Relaxed);
             tracing::debug!("repeated mismatch: {}", m.summary());
             return match mode {
@@ -446,6 +489,9 @@ impl Policy {
             h.push_back(m.clone());
         }
         self.events.send(UiEvent::Mismatch(m.clone()), &self.stats);
+        if let Some(ep) = opened {
+            return self.opened(&ep, m, mode);
+        }
         match mode {
             MismatchMode::Resync if m.resyncable => Verdict::Resync,
             MismatchMode::Resync | MismatchMode::Log => Verdict::Continue,
@@ -463,6 +509,74 @@ impl Policy {
             tracing::error!(
                 "secondary DETACHED: from now on operations go to the primary only, nothing is compared"
             );
+        }
+        if let Some(ep) = self.episodes.end_detached() {
+            self.episode_ended(&ep);
+        }
+    }
+
+    /// A secondary-fault episode was opened by `m` (reported above): reports the episode, and acts on it as
+    /// `--on-secondary-fault` says. `m` itself is handled like the faults of the burst before it, by the mismatch
+    /// mode; `freeze` holds it once for the whole episode.
+    fn opened(&self, ep: &Episode, m: Arc<Mismatch>, mode: MismatchMode) -> Verdict {
+        tracing::error!(
+            target: "xcheckfs::mismatch",
+            "SECONDARY FAULT EPISODE #{} opened by mismatch #{}: the secondary is failing as a whole. Further faults \
+             and their knock-on mismatches are counted in the episode (`xcheckfs ctl MOUNTPOINT episodes`); repairs \
+             are deferred until it ends. {}",
+            ep.id,
+            m.id,
+            ep.describe()
+        );
+        self.events.send(UiEvent::Episode { id: ep.id, open: true, text: ep.describe() }, &self.stats);
+        match (self.episodes.config().mode, mode) {
+            (FaultMode::Detach, MismatchMode::Fail) => {
+                self.detach();
+                Verdict::Fail
+            }
+            (FaultMode::Detach, _) => {
+                self.detach();
+                Verdict::Continue
+            }
+            // (fail mode returns EIO for every mismatch, whatever the decision)
+            (FaultMode::Freeze, MismatchMode::Fail) => match self.freeze(m) {
+                Verdict::Continue => Verdict::Fail,
+                v => v,
+            },
+            (FaultMode::Freeze, _) | (FaultMode::Log, MismatchMode::Freeze) => self.freeze(m),
+            (FaultMode::Log, MismatchMode::Resync) if m.resyncable => Verdict::Resync,
+            (FaultMode::Log, MismatchMode::Fail) => Verdict::Fail,
+            (FaultMode::Log, MismatchMode::Detach) => {
+                self.detach();
+                Verdict::Continue
+            }
+            (FaultMode::Log, _) => Verdict::Continue,
+        }
+    }
+
+    fn episode_ended(&self, ep: &Episode) {
+        tracing::error!(
+            target: "xcheckfs::mismatch",
+            "SECONDARY FAULT EPISODE #{} ended ({}): {}",
+            ep.id,
+            ep.end_reason.unwrap_or("?"),
+            ep.describe()
+        );
+        self.events.send(UiEvent::Episode { id: ep.id, open: false, text: ep.describe() }, &self.stats);
+    }
+
+    /// Ends the open episode when it has been quiet long enough and `answers()` (a probe of the secondary) says the
+    /// secondary works again; logs the progress of an open one. Returns true when an episode ended.
+    pub fn episode_tick(&self, answers: impl FnOnce() -> bool) -> bool {
+        if let Some(ep) = self.episodes.progress() {
+            tracing::warn!("secondary-fault episode #{} {}", ep.id, ep.describe());
+        }
+        match self.episodes.tick(answers) {
+            Some(ep) => {
+                self.episode_ended(&ep);
+                true
+            }
+            None => false,
         }
     }
 
@@ -550,6 +664,8 @@ mod tests {
             detail: String::new(),
             retryable: false,
             resyncable: false,
+            fault: None,
+            entry: false,
         }
     }
 

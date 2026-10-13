@@ -8,6 +8,7 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod engine;
+pub mod episode;
 pub mod events;
 pub mod fusefs;
 pub mod logging;

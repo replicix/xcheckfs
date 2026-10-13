@@ -102,18 +102,28 @@ Details: [Design](docs/explanation/DESIGN.md#mismatch-handling).
 Known, harmless differences are silenced with an
 [allow-rules file](docs/reference/rules.md).
 
+When the secondary fails as a whole (a restart, lost storage or network, a
+full or read-only file system), a burst of errors on many objects opens a
+*secondary-fault episode*: one finding that counts the failed operations and
+their knock-on mismatches (the first ones kept verbatim) instead of reporting
+thousands, and holds repairs back until the secondary works again.
+`--on-secondary-fault log|freeze|detach` chooses what it does. See
+[Design](docs/explanation/DESIGN.md#secondary-fault-episodes).
+
 ## Controlling a running mount
 
 ```bash
 xcheckfs ctl /mnt status               # counters, mode, state (running/frozen/detached)
 xcheckfs ctl /mnt mismatches 10        # the last 10 mismatches as JSON
+xcheckfs ctl /mnt episodes             # secondary-fault episodes, with their first mismatches
 xcheckfs ctl /mnt pending              # frozen mismatches waiting for a decision
 xcheckfs ctl /mnt resolve 3 resync     # decide on mismatch #3
 xcheckfs ctl /mnt mode freeze          # change the mismatch mode
 ```
 
 Protocol and all commands: [Control protocol](docs/reference/control-protocol.md).
-Exit codes: `mount` returns 3 if any mismatch was recorded; `verify` returns 3
+Exit codes: `mount` returns 3 if any mismatch or secondary-fault episode was
+recorded; `verify` returns 3
 on differences. See the [CLI reference](docs/reference/cli.md).
 
 ## Documentation

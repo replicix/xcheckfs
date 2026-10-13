@@ -289,6 +289,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
             Style::new(),
         )
+    } else if let Some((id, n)) = app.episode {
+        (
+            format!(" SECONDARY FAULT #{id}: {} ", fmt_count(n)),
+            Style::new()
+                .fg(Color::White)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+            Style::new(),
+        )
     } else {
         (
             " RUNNING ".into(),
@@ -371,6 +380,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" repeats ", DIM),
         Span::raw(app.stats.repeats.load(Relaxed).to_string()),
     ];
+    let episodes = app.stats.episodes.load(Relaxed);
+    if episodes > 0 {
+        spans.push(sep.clone());
+        spans.push(Span::styled("episodes ", DIM));
+        spans.push(Span::styled(
+            format!("{episodes} ({})", fmt_count(app.stats.episode_mismatches.load(Relaxed))),
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(oldest) = app.inflight.first() {
         let age = oldest.started.elapsed().as_secs_f64();
         if age >= 1.0 {
@@ -745,7 +763,7 @@ fn draw_counters(f: &mut Frame, app: &App, area: Rect) {
         ),
         (
             ("quarantined", l(&s.quarantined), false),
-            ("", 0, false),
+            ("deferred", l(&s.deferred_repairs), true),
         ),
     ];
     let lines: Vec<Line> = pairs
@@ -1434,6 +1452,8 @@ mod tests {
                 detail: "bytes differ at offset 3".into(),
                 retryable: true,
                 resyncable: false,
+                fault: None,
+                entry: false,
             })
         });
         while policy.pending().is_empty() {

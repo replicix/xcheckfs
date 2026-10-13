@@ -57,8 +57,9 @@ until mountpoint -q "$M"; do kill -0 $XC || exit 1; sleep 0.2; done  # give up i
 run_the_workload "$M"; WL=$?                  # pjdfstest, fsx, fsstress, your tests...
 
 xcheckfs ctl "$M" mismatches 1000 > mismatches.json   # artifact for the job
+xcheckfs ctl "$M" episodes > episodes.json    # secondary-fault episodes, if any
 fusermount3 -u "$M"
-wait $XC; MIRROR=$?                           # 0 clean, 3 mismatches, 1 error
+wait $XC; MIRROR=$?                           # 0 clean, 3 mismatches or episodes, 1 error
 
 xcheckfs verify "$P" "$S"; VERIFY=$?          # 0 identical, 3 differences, 2 unreadable
 
@@ -89,7 +90,7 @@ xcheckfs verify "$P" "$S"; VERIFY=$?          # 0 identical, 3 differences, 2 un
   read the count instead and then stop the daemon.
 
   ```bash
-  n=$(xcheckfs ctl "$M" status | jq .mismatches)
+  n=$(xcheckfs ctl "$M" status | jq '.mismatches + .episodes')
   kill "$(cat FILE)"                        # or: fusermount3 -u "$M"
   [ "$n" -eq 0 ]
   ```
@@ -107,5 +108,12 @@ xcheckfs verify "$P" "$S"; VERIFY=$?          # 0 identical, 3 differences, 2 un
   ([Control protocol](../reference/control-protocol.md#mismatch)).
 - A workload failing with `EIO` and no mismatch in the log is a failure of
   the workload or the primary, not of the comparison.
+- `SECONDARY FAULT EPISODE #N` lines mean the secondary failed as a whole
+  for a while (an outage, not a defect of one object): its failed operations
+  and their knock-on mismatches are counted in the episode instead of being
+  listed; `xcheckfs ctl "$M" episodes` shows the counts and the first ones
+  ([Design](../explanation/DESIGN.md#secondary-fault-episodes)). Such a run
+  exits with 3 like one with mismatches. Find out why the secondary failed
+  (its own logs) before reading anything else into the run.
 - `verify` after the run finds differences the live comparison could not see
   ([Limitations](../reference/limitations.md#caching)).

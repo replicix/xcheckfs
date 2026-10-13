@@ -50,6 +50,7 @@ echo status | socat - UNIX-CONNECT:/run/xcheckfs/data-0123456789abcdef.sock
 | `status` (also an empty line) | The [status object](#status). |
 | `stats` | `{"ok", "ops": [...], "status": {...}}`: one entry per operation with a non-zero count (`op`, `count`, `errno_results` (operations the primary answered with an errno — normal results, not errors), `mismatches`, `bytes`, `p50_ns`, `p99_ns`, `max_ns` and `primary_p50_ns`, `primary_p99_ns`, `secondary_p50_ns`, `secondary_p99_ns`). |
 | `mismatches [N]` | `{"ok", "mismatches": [...]}`: the last `N` (default 50) [mismatches](#mismatch), newest first. At most the last 1000 are kept. |
+| `episodes [N]` | `{"ok", "episodes": [...]}`: the last `N` (default 10) [secondary-fault episodes](#episode), newest first, with their records. At most the last 64 are kept. |
 | `pending` | `{"ok", "pending": [...]}`: frozen mismatches awaiting a decision. |
 | `resolve ID ACTION` | `{"ok": true}`, or an error if `ID` is not pending. `ACTION` is `continue`, `retry`, `resync`, `fail`, `detach`, `allow` or `allow-path`. |
 | `mode MODE` | `{"ok": true, "mode": "..."}`. `MODE` is `resync`, `log`, `fail`, `freeze` or `detach`. Leaving `freeze` releases everything pending with `continue`. |
@@ -77,6 +78,10 @@ letters `c`, `r`, `s`, `e`, `d` are accepted for `continue`, `retry`,
 | `mismatches` | mismatches recorded (excluding allowed and repeats) |
 | `allowed` | mismatches dropped by allow rules |
 | `repeats` | identical mismatches suppressed by [deduplication](../explanation/DESIGN.md#deduplication) |
+| `episodes` | [secondary-fault episodes](../explanation/DESIGN.md#secondary-fault-episodes) opened |
+| `episode_mismatches` | mismatches counted in an episode instead of being reported one by one |
+| `episode` | the open [episode](#episode) without its `records`, or `null` |
+| `deferred_repairs` | objects and names whose repair was deferred during a secondary-fault episode and has not run yet (queued, or running after the episode ended) |
 | `pending` | frozen mismatches awaiting a decision |
 | `secondary_skipped` | operations whose secondary half was skipped because the object does not exist on the secondary |
 | `verifications` | read-backs and content/listing comparisons done at `thorough`/`paranoid` |
@@ -123,3 +128,24 @@ are fixed at mount, from the
 | `primary`, `secondary` | the two values |
 | `detail` | human-readable explanation |
 | `retryable`, `resyncable` | which decisions are available |
+
+### Episode
+
+A [secondary-fault episode](../explanation/DESIGN.md#secondary-fault-episodes).
+
+| Field | Meaning |
+|---|---|
+| `id` | sequence number, as in the `SECONDARY FAULT EPISODE #N` log lines |
+| `started` | Unix time of the first fault of the burst that opened it |
+| `opened` | Unix time it was opened |
+| `ended`, `end_reason` | when and why it ended (`quiet`: no fault for `--episode-quiet` and the secondary answered; `detached`); `null` while open |
+| `burst` | the faults that opened it (`time`, `op`, `path`, `errno`), oldest first; each was reported as a mismatch |
+| `mismatches` | mismatches counted in it: `faults` + `knock_ons` |
+| `faults` | secondary faults while it was open |
+| `knock_ons` | mismatches about what diverged in it (by a mutation), while it was open |
+| `by_op`, `by_errno`, `by_kind` | the counted mismatches per operation, per errno (faults only) and per kind |
+| `objects`, `names` | distinct objects (directories included) and names it tainted |
+| `untracked` | taints not recorded because the tables were full: knock-ons on those were reported one by one |
+| `repairs_deferred`, `repairs_dropped` | repairs deferred while it was open, and those that did not fit in the queue (repaired when a mismatch on the object asks again) |
+| `records` | examples of the counted mismatches (the first 20, then the first of each cause, operation, kind and field, up to 100): `cause` (`fault` or `knock-on`) and the [mismatch](#mismatch) (its `id` is 0: it was not reported) |
+| `summary` | one line describing it |

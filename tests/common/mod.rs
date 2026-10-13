@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use xcheckfs::backend::fault::{Effect, Fault, FaultBackend, FaultId, FaultOp};
 use xcheckfs::backend::posix::PosixBackend;
 use xcheckfs::backend::{Backend, Lock, TimeSpec, XattrOut};
-use xcheckfs::config::{CheckLevel, EngineConfig, MismatchMode};
+use xcheckfs::config::{CheckLevel, EngineConfig, EpisodeConfig, MismatchMode};
 use xcheckfs::engine::{Attr, Ctx, Engine, ROOT_ID, SetAttr};
 use xcheckfs::events::EventSink;
 use xcheckfs::policy::{Action, Mismatch, MismatchKind, Policy, Rule};
@@ -110,6 +110,7 @@ pub struct HarnessBuilder {
     tweak: Option<Tweak>,
     events: Option<usize>,
     pre_faults: Vec<Fault>,
+    episodes: EpisodeConfig,
 }
 
 impl HarnessBuilder {
@@ -140,6 +141,11 @@ impl HarnessBuilder {
     /// behave like another kind of file system).
     pub fn secondary_fault(mut self, f: Fault) -> Self {
         self.pre_faults.push(f);
+        self
+    }
+    /// Secondary-fault episodes (off unless switched on here).
+    pub fn episodes(mut self, f: impl FnOnce(&mut EpisodeConfig)) -> Self {
+        f(&mut self.episodes);
         self
     }
     pub fn config(mut self, f: impl FnOnce(&mut EngineConfig) + 'static) -> Self {
@@ -185,11 +191,14 @@ impl HarnessBuilder {
         for f in self.pre_faults {
             fault.add(f);
         }
-        let policy = Arc::new(Policy::new(self.mode, self.rules, None, false, sink.clone(), stats.clone()).unwrap());
+        let policy = Arc::new(
+            Policy::new(self.mode, self.rules, None, false, sink.clone(), stats.clone()).unwrap().with_episodes(self.episodes),
+        );
         let engine = Arc::new(
             Engine::new(cfg, pfault.clone(), fault.clone(), policy.clone(), stats.clone(), sink).unwrap(),
         );
         Engine::spawn_lock_watchdog(&engine);
+        Engine::spawn_episode_watch(&engine);
         Harness { engine, policy, stats, pfault, fault, ptmp, stmp, ctx: ctx(), mark: AtomicUsize::new(0), events }
     }
 }
@@ -237,6 +246,8 @@ impl Harness {
             tweak: None,
             events: None,
             pre_faults: Vec::new(),
+            // (the tests of everything else see every mismatch reported: `tests/engine_episode.rs` switches them on)
+            episodes: EpisodeConfig { errors: 0, ..EpisodeConfig::default() },
         }
     }
 
@@ -275,6 +286,10 @@ impl Harness {
     }
     pub fn inject_always(&self, op: FaultOp, e: Effect) -> FaultId {
         self.fault.inject(op, e)
+    }
+    /// The secondary fails every call with `errno` (an outage of the file system as a whole), until `clear_faults`.
+    pub fn outage(&self, errno: i32) -> Vec<FaultId> {
+        FaultOp::ALL.iter().filter(|&&op| op != FaultOp::Root).map(|&op| self.fault.inject(op, Effect::Errno(errno))).collect()
     }
     pub fn clear_faults(&self) {
         self.fault.clear();

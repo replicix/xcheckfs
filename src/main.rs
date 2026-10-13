@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::Level;
 
 use xcheckfs::backend::posix::PosixBackend;
-use xcheckfs::config::{CheckLevel, DirectIo, EngineConfig, MismatchMode, Serialization};
+use xcheckfs::config::{CheckLevel, DirectIo, EngineConfig, EpisodeConfig, FaultMode, MismatchMode, Serialization};
 use xcheckfs::control;
 use xcheckfs::engine::Engine;
 use xcheckfs::events::EventSink;
@@ -113,6 +113,24 @@ struct MountArgs {
     /// (it then stays diverged and is used on the primary only).
     #[arg(long, default_value_t = 5)]
     resync_limit: u32,
+    /// What a secondary-fault episode does. An episode is the secondary failing
+    /// as a whole (an outage: errors such as EIO or ENOSPC on many objects at
+    /// once, see --episode-errors): one finding, in which its faults and their
+    /// knock-on mismatches are counted instead of being reported one by one,
+    /// and repairs wait until it ends. `log` reports it, `freeze` waits once
+    /// for an operator decision, `detach` stops using the secondary.
+    #[arg(long, value_enum, default_value_t = FaultMode::Log)]
+    on_secondary_fault: FaultMode,
+    /// Secondary faults (EIO, ENOSPC, EROFS, ENOTCONN, ESTALE, ... where the
+    /// primary answered otherwise) within 10 s that open an episode, when they
+    /// are on at least 4 objects and at least a quarter of the operations that
+    /// ran on the secondary meanwhile; 0 switches episodes off.
+    #[arg(long, default_value_t = 8, value_parser = parse_episode_errors)]
+    episode_errors: u32,
+    /// An episode ends after this long without a secondary fault, once the
+    /// secondary answers again.
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    episode_quiet: Duration,
     /// Allow-rules file [default: /etc/xcheckfs/rules.toml as root, else
     /// $XDG_CONFIG_HOME/xcheckfs/rules.toml].
     #[arg(long)]
@@ -235,11 +253,20 @@ struct CtlArgs {
     /// Mount point of the running xcheckfs.
     #[arg(required_unless_present = "socket")]
     mountpoint: Option<PathBuf>,
-    /// status | stats | mismatches [N] | pending | resolve ID ACTION |
+    /// status | stats | mismatches [N] | episodes [N] | pending | resolve ID ACTION |
     /// mode MODE | detach | rules. ACTION: continue, retry, resync, fail,
     /// detach, allow, allow-path.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
+}
+
+/// 0 (off), or enough faults to be on the 4 objects an episode needs.
+fn parse_episode_errors(s: &str) -> Result<u32, String> {
+    let n: u32 = s.parse().map_err(|_| format!("invalid number {s:?}"))?;
+    if n != 0 && n < xcheckfs::episode::OBJECTS as u32 {
+        return Err(format!("0 (off) or at least {} (the objects an episode is on)", xcheckfs::episode::OBJECTS));
+    }
+    Ok(n)
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -492,7 +519,14 @@ fn run_mount(
     let threads = a
         .threads
         .unwrap_or_else(|| (2 * std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).clamp(16, 64));
-    let policy = Arc::new(Policy::new(a.on_mismatch, rules, rules_path.clone(), persist, sink.clone(), stats.clone())?);
+    let episodes = EpisodeConfig {
+        mode: a.on_secondary_fault,
+        errors: a.episode_errors,
+        quiet: a.episode_quiet,
+    };
+    let policy = Arc::new(
+        Policy::new(a.on_mismatch, rules, rules_path.clone(), persist, sink.clone(), stats.clone())?.with_episodes(episodes),
+    );
     let cfg = EngineConfig {
         check: a.check,
         time_tolerance: a.time_tolerance,
@@ -514,6 +548,7 @@ fn run_mount(
     };
     let engine = Arc::new(Engine::new(cfg.clone(), Arc::new(pb), Arc::new(sb), policy.clone(), stats.clone(), sink)?);
     Engine::spawn_lock_watchdog(&engine);
+    Engine::spawn_episode_watch(&engine);
 
     let info = serde_json::json!({
         "mountpoint": mountpoint.display().to_string(),
@@ -542,12 +577,13 @@ fn run_mount(
         .with_context(|| format!("mount on {}", mountpoint.display()))?;
     let bg = session.spawn()?;
     tracing::warn!(
-        "mounted {} on {}, mirroring to {}, check={} on-mismatch={}{}",
+        "mounted {} on {}, mirroring to {}, check={} on-mismatch={} on-secondary-fault={}{}",
         primary.display(),
         mountpoint.display(),
         secondary.display(),
         a.check.name(),
         a.on_mismatch.name(),
+        a.on_secondary_fault.name(),
         if mountpoint == primary { " [mounted over the primary: all access goes through xcheckfs]" } else { "" }
     );
     // Only now: a failed start must not clobber another daemon's pid file.
@@ -624,6 +660,24 @@ fn run_mount(
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+    if let Some(ep) = policy.episodes().current() {
+        tracing::error!("SECONDARY FAULT EPISODE #{} still open at unmount: {}", ep.id, ep.describe());
+    } else {
+        // (the repairs deferred during an episode that just ended may still be running: a while for them)
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while stats.deferred_repairs.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let left = stats.deferred_repairs.load(Ordering::Relaxed);
+    if left > 0 {
+        tracing::error!(
+            "{left} repairs deferred during a secondary-fault episode did not run: those objects and names may still \
+             differ on the secondary; run `xcheckfs verify {} {}` before mounting again",
+            primary.display(),
+            secondary.display()
+        );
+    }
     let summary = control::summary(&stats);
     tracing::warn!("unmounted: {summary}");
     if a.ui == Ui::Tui {
@@ -632,7 +686,8 @@ fn run_mount(
     if let Some(p) = &a.pid_file {
         let _ = std::fs::remove_file(p);
     }
-    let mismatches = stats.mismatches.load(Ordering::Relaxed);
+    // (a secondary-fault episode fails a run like a mismatch: it is one)
+    let mismatches = stats.mismatches.load(Ordering::Relaxed) + stats.episodes.load(Ordering::Relaxed);
     Ok(if mismatches > 0 { 3 } else { 0 })
 }
 

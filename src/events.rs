@@ -30,6 +30,8 @@ pub struct OpEvent {
 pub enum UiEvent {
     Op(OpEvent),
     Mismatch(Arc<Mismatch>),
+    /// A secondary-fault episode opened or ended (`episode`); `text` describes it.
+    Episode { id: u64, open: bool, text: String },
     Log { level: tracing::Level, message: String },
 }
 

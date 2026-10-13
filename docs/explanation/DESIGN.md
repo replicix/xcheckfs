@@ -20,6 +20,7 @@ flags, formats and lists, and the ADRs record the alternatives rejected.
 - [Mismatch handling](#mismatch-handling)
 - [Freeze gate](#freeze-gate)
 - [Deduplication](#deduplication)
+- [Secondary-fault episodes](#secondary-fault-episodes)
 - [Repair (resync)](#repair-resync)
 - [Detach](#detach)
 - [Processes and threads](#processes-and-threads)
@@ -352,6 +353,13 @@ on the xcheckfs side wakes waiters in one order for both. Second, a blocked
 backend call parks a worker thread while it holds the inode's lockstep lock,
 so the operation that would release the lock cannot proceed.
 
+**One process holds every client's locks on the secondary.** The open file
+descriptions are xcheckfs's, so a file system that fences a lock owner's
+*process* after a lost lock (a lease that lapsed during a stall) fences
+xcheckfs as a whole and fails every client's operations: a
+[secondary-fault episode](#secondary-fault-episodes)
+([Limitations](../reference/limitations.md#locking)).
+
 `flock(2)` is not mirrored: the kernel handles it locally
 ([ADR-9](DECISIONS.md#adr-9-flock2-stays-kernel-local-ioctl-is-not-mirrored)).
 `--no-lock-mirroring` hands `fcntl` locks to the kernel as well.
@@ -365,9 +373,13 @@ operation, a path, and the two values. The policy then:
 
 1. drops it if an [allow rule](../reference/rules.md) matches (counted as
    `allowed`);
-2. drops it if an identical one was already reported ([dedup](#deduplication));
+2. counts it in a [secondary-fault episode](#secondary-fault-episodes) if it
+   is a secondary fault while one is open, or a knock-on of the open one (the
+   mode still applies: `fail` returns `EIO`, `resync` repairs, once the
+   episode has ended);
+3. drops it if an identical one was already reported ([dedup](#deduplication));
    in `resync` mode a repeat is still repaired;
-3. records it, logs it at error level, notifies the UI, and acts according to
+4. records it, logs it at error level, notifies the UI, and acts according to
    the mode.
 
 | Mode | Effect on the operation |
@@ -418,6 +430,115 @@ fails can freeze again.
 
 Allowed mismatches never enter the dedup table and are counted separately.
 
+Deduplication keys on one object, so it cannot help when the secondary fails
+as a whole: every failed operation is about another object. That is what
+[episodes](#secondary-fault-episodes) are for. A mismatch counted in an
+episode enters the dedup table like a reported one: found again after the
+episode, it is a repeat.
+
+## Secondary-fault episodes
+
+When the secondary stops working as a whole (its daemon restarts, its storage
+or network goes away, it fills up, it is remounted read-only, or it fences
+xcheckfs's process, see [Lock mirroring](#lock-mirroring)), it fails nearly
+every operation while the primary carries them out. Reported one by one, an
+outage of a few seconds under a busy workload is tens of thousands of
+mismatches: each failed mutation makes the trees diverge, every later
+operation on what diverged adds knock-on mismatches (a name whose create
+failed is missing on the secondary, so its lookup, unlink and rename differ
+too), and in `resync` mode each fires a repair into a secondary that cannot
+take it. An *episode* is the outage as one finding
+([ADR-14](DECISIONS.md#adr-14-a-secondary-outage-is-one-finding-secondary-fault-episodes)).
+
+**Secondary fault.** A mismatch in which the secondary failed with an errno
+that says the file system is unwell, where the primary answered otherwise:
+I/O errors and corruption (`EIO`, `EREMOTEIO`, `EUCLEAN`), a lost device
+(`ENODEV`, `ENXIO`), a lost connection (`ENOTCONN`, `ECONNRESET`,
+`ECONNABORTED`, `ECONNREFUSED`, `ETIMEDOUT`, `ESHUTDOWN`, `EHOSTDOWN`,
+`EHOSTUNREACH`, `ENETDOWN`, `ENETUNREACH`), handles invalidated by a restart
+(`ESTALE`), no memory or space (`ENOMEM`, `ENOSPC`, `EDQUOT`), a read-only
+remount (`EROFS`). Answers about the request (`ENOENT`, `EEXIST`, `EACCES`,
+`EOPNOTSUPP`, ...) are not faults: they are what a defect of one object or one
+operation looks like.
+
+**Opening.** A burst opens an episode: at least `--episode-errors` (8, at
+least 4) faults within 10 s, on at least 4 distinct objects (a name in a
+directory counts as its own object), making up at least a quarter of the
+operations that ran on the secondary meanwhile. Each condition keeps
+something ordinary out: a single error is reported as always; one object
+failing again and again is one mismatch and its repeats; and a secondary
+that fails one operation in twenty has defects, which are reported and
+repaired one by one. The faults of the burst are reported as mismatches (the
+episode is not known yet); the one that completes the burst also opens the
+episode, which is logged at error level
+(`SECONDARY FAULT EPISODE #N opened by mismatch #M`).
+
+**While open**, a fault and every knock-on is counted in the episode instead
+of being reported: per operation, errno and kind, with examples kept
+verbatim (the first 20, then the first of each cause, operation, kind and
+field, up to 100). Knock-ons are found by *taint*: a fault of an operation
+that may have changed something taints its name and directory (a name-based
+operation) or its object; a mismatch about a tainted name, or about a tainted
+object other than a name in it, is a knock-on, and taints what it is about in
+turn when its operation is a mutation. A read-only operation changes nothing:
+its fault is counted, but taints nothing. Everything else is reported as
+usual, also during an episode. Counted mismatches are not in the per-operation
+error counts (the TUI's operations table, `ctl stats`) or in
+`ctl mismatches`: they are in the episode (`ctl episodes`).
+
+**Ending.** The episode ends after `--episode-quiet` (30 s) without a fault,
+once the secondary answers a probe (a stat of its root): a workload that
+stopped, or a secondary that hangs, is no evidence that it works again. A
+success alone does not end it: a partial outage (no space: reads work, writes
+fail) interleaves successes with faults, and ending on them would split it
+into many episodes with repairs in between. An open episode logs its
+progress every 10 s; its end is logged at error level with a summary.
+
+**After the end** the taint is gone: every mismatch is reported as usual.
+The mismatches counted in the episode are in the
+[deduplication](#deduplication) table, so finding one of them again is a
+repeat (repaired in `resync` mode), exactly as after a reported mismatch; a
+difference that arises later, on an object the episode touched, is new and
+reported. In `log` mode, which does not repair, the knock-ons the episode did
+not meet while it was open are reported when they are met.
+
+**Repairs** are deferred while an episode is open: a repair into a failing
+secondary fails, and leaves the object diverged and primary-only. They are
+merged per object like the repairs of one operation and run, verified as
+usual, when the episode ends (by the watcher thread, each with its own locks
+and descriptors). The repairs of the burst's own faults ran before the
+episode was known and failed with a fault on the secondary; they are deferred
+too when the episode opens, and an object a failed repair detached from the
+secondary is found again by its path. The queue is bounded (16 384 objects
+and names, and an eighth of the descriptor budget in objects: each holds its
+node's descriptors); a repair that does not fit is counted in the episode
+(`repairs_dropped`), and its object is repaired when a mismatch on it asks
+again. At unmount xcheckfs waits up to 10 s for deferred repairs that are
+running; any that did not run are logged at error level and in the summary,
+with the advice to run `verify`.
+
+**Policy.** `--on-secondary-fault` decides what an episode does:
+
+| Mode | Effect |
+|---|---|
+| `log` (default) | The episode is reported; operations get the primary's result. The fault that opened it is handled by the mismatch mode, like the faults of the burst before it. |
+| `freeze` | The operation that opened the episode waits for an operator decision, once for the whole episode ([freeze gate](#freeze-gate)); faults of operations already past the gate are counted. In `fail` mode it returns `EIO` whatever the decision, like every mismatch there. |
+| `detach` | The secondary is [detached](#detach), which ends the episode. |
+
+The mismatch mode still applies to counted mismatches: `fail` returns `EIO`,
+`resync` defers a repair, `detach` (set at runtime) detaches.
+
+**Nothing is hidden.** Every mismatch is either reported or counted in an
+episode with examples verbatim, and the episode itself is a finding: it is in
+`ctl status` and `ctl episodes`, the TUI header, the logs and the summary, and
+a run with an episode exits with 3 like one with a mismatch. What an episode
+cannot tell apart: a real defect of the secondary on a tainted object, met
+while the episode is open, is counted in the episode, not reported on its own.
+
+**Cost.** Nothing on an operation without a mismatch. A mismatch that is no
+fault costs an atomic load while no episode is open; a fault takes a mutex
+and, while no episode is open, sums the operation counters.
+
 ## Repair (resync)
 
 Repair makes the secondary equal to the primary again, so that a run on live
@@ -444,6 +565,9 @@ chunks that differ, then the size) and copies extended attributes, owner,
 mode and times. A directory object is repaired as a directory: its entries
 and its attributes. An object whose type or symlink target differs cannot be
 fixed in place; its entry is replaced.
+
+While a [secondary-fault episode](#secondary-fault-episodes) is open, repairs
+are not run but deferred until it ends.
 
 **Entry repair** compares the name on both sides and:
 

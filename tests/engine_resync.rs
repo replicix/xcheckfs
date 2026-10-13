@@ -1480,6 +1480,37 @@ fn failed_entry_repair_is_bounded_and_the_primary_untouched() {
     assert_eq!(cnt(&h).resyncs, 0, "the budget of /only_primary is used up for ten minutes");
 }
 
+/// A repair that replaces an object found by its path (here: of the wrong type) does not lock the ancestors. When one is
+/// renamed between the path's resolution and the repair, and another object of the same kind takes the old path, the
+/// object must not be attached to that one's secondary.
+#[test]
+fn repair_by_path_does_not_attach_to_what_a_rename_put_in_its_place() {
+    let h = Arc::new(rs().build_with(|p, s| {
+        write(p, "a/f", b"file");
+        std::fs::create_dir(s.join("a")).unwrap();
+        symlink("elsewhere", s.join("a/f")).unwrap();
+    }));
+    let a = h.lookup("/a");
+    // (the next lookup of "a" on the primary is the repair's, resolving /a/f)
+    let gate = xcheckfs::backend::fault::Gate::new();
+    h.pfault.add(Fault::new(FaultOp::Lookup, Effect::Gate(gate.clone())).name("a").once());
+    let h2 = h.clone();
+    let t = std::thread::spawn(move || h2.engine.lookup(&h2.ctx, a.id, &os("f")).map(|a| a.st.size));
+    assert!(gate.wait_arrived(1, Duration::from_secs(10)), "the type mismatch must start a repair by path");
+    // /a is renamed to /b on both file systems, and a new /a/f appears, as concurrent operations would do
+    for root in [h.p_root(), h.s_root()] {
+        std::fs::rename(root.join("a"), root.join("b")).unwrap();
+        write(root, "a/f", b"another");
+    }
+    gate.open();
+    assert_eq!(t.join().unwrap(), Ok(4), "the primary's result");
+    assert!(h.stats.resync_failures.load(Relaxed) >= 1, "the path no longer leads to the object");
+    // the new /a/f is its own object on both sides: no node claims its secondary
+    h.mark();
+    assert_eq!(h.lookup("/a/f").st.size, 7);
+    h.assert_no_mismatch_kind(K::Identity);
+}
+
 // =================================================================================================================
 // 7. Repair budget
 // =================================================================================================================
