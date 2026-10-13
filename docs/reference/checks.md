@@ -160,7 +160,7 @@ is racy and the ordinary comparison always applies.
 | size of directories | format specific |
 | absolute `ctime` | see above |
 | `statfs` values | capacities differ by nature; only the result is compared |
-| `security.selinux` (by `verify`) | the label is assigned by the security policy for each mount, not kept by the file system |
+| `security.selinux` | the label is assigned by the security policy for each mount, not kept by the file system (a FUSE secondary has none where an ext4 primary labels every inode). Reading, setting and removing it reach the primary only; `listxattr` compares the names without it, and `verify` skips it |
 | order of directory entries and of xattr names | file-system specific |
 | `SEEK_DATA` / `SEEK_HOLE` offsets | hole granularity is file-system specific |
 | pid of a conflicting lock | always reported as 0 |

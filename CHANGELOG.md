@@ -86,6 +86,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- SELinux labels (`security.selinux`) are no longer compared by the live
+  `listxattr`/`getxattr` checks (`verify` already skipped them): the policy
+  assigns them per mount, so a FUSE secondary on an SELinux host, which has
+  none, produced a mismatch for every file. They are read, set and removed on
+  the primary only.
 - `fsync` and `fsyncdir` no longer hold the object's lock. An `fsyncdir`
   under directory churn takes seconds on ext4; holding the directory shared,
   it queued the next create behind it, and every lookup in the directory

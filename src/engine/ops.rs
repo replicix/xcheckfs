@@ -20,6 +20,15 @@ use crate::sys::{self, FileKind, Stat, SysResult};
 const VERIFY_CAP: u64 = 16 << 20;
 const XATTR_MAX: usize = 65536;
 
+/// Extended attributes that the security policy assigns per mount instead of the file system keeping them: SELinux
+/// labels. A FUSE secondary, for one, has none where an ext4 primary labels every inode. They are read, set and
+/// removed on the primary only and left out of every comparison (as `verify` does).
+const POLICY_XATTRS: &[&[u8]] = &[b"security.selinux"];
+
+fn policy_xattr(name: &[u8]) -> bool {
+    POLICY_XATTRS.contains(&name)
+}
+
 impl Engine {
     // ------------------------------------------------------------- helpers
 
@@ -1329,7 +1338,7 @@ impl Engine {
             let n = self.node(ino)?;
             let c = cname(name)?;
             let _l = self.lock(&[(ino, true)]);
-            let sec = self.sec_for(&[&n]);
+            let sec = self.sec_for(&[&n]) && !policy_xattr(c.to_bytes());
             let creds = self.creds(ctx);
             let (p, s) = self.both(cx, sec, creds.as_ref(), |side, be| be.setxattr(n.fd(side).as_fd(), &c, value, flags));
             self.cmp_result(cx, &n, None, &p, &s, true)?;
@@ -1353,7 +1362,7 @@ impl Engine {
             let n = self.node(ino)?;
             let c = cname(name)?;
             let _l = self.lock(&[(ino, false)]);
-            let sec = self.sec_for(&[&n]);
+            let sec = self.sec_for(&[&n]) && !policy_xattr(c.to_bytes());
             let (p, s) = self.both(cx, sec, None, |side, be| be.getxattr(n.fd(side).as_fd(), &c, size as usize));
             self.cmp_result(cx, &n, None, &p, &s, false)?;
             let pv = p?;
@@ -1374,9 +1383,17 @@ impl Engine {
             self.cmp_result(cx, &n, None, &p, &s, false)?;
             let pv = p?;
             if let Some(Ok(sv)) = &s {
+                let names = |d: &[u8]| -> Vec<Vec<u8>> {
+                    compare::xattr_names(d).into_iter().filter(|n| !policy_xattr(n)).map(<[u8]>::to_vec).collect()
+                };
                 let same = match (&pv, sv) {
-                    (XattrOut::Data(a), XattrOut::Data(b)) => compare::xattr_names(a) == compare::xattr_names(b),
-                    (a, b) => a == b,
+                    (XattrOut::Data(a), XattrOut::Data(b)) => names(a) == names(b),
+                    (XattrOut::Size(a), XattrOut::Size(b)) if a == b => true,
+                    // sizes that differ may differ by a policy attribute only: compare the lists
+                    _ => matches!(
+                        (self.b[0].listxattr(n.p(), XATTR_MAX), self.b[1].listxattr(n.fd(Side::Secondary).as_fd(), XATTR_MAX)),
+                        (Ok(XattrOut::Data(a)), Ok(XattrOut::Data(b))) if names(&a) == names(&b)
+                    ),
                 };
                 if !same {
                     let names = |x: &XattrOut| match x {
@@ -1395,7 +1412,7 @@ impl Engine {
             let n = self.node(ino)?;
             let c = cname(name)?;
             let _l = self.lock(&[(ino, true)]);
-            let sec = self.sec_for(&[&n]);
+            let sec = self.sec_for(&[&n]) && !policy_xattr(c.to_bytes());
             let creds = self.creds(ctx);
             let (p, s) = self.both(cx, sec, creds.as_ref(), |side, be| be.removexattr(n.fd(side).as_fd(), &c));
             self.cmp_result(cx, &n, None, &p, &s, true)?;

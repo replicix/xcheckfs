@@ -541,6 +541,34 @@ fn symlink_target_verified_at_creation_only_by_thorough() {
 
 // ----------------------------------------------------------------------------------------------- xattrs
 
+/// SELinux labels are assigned per mount by the policy: an ext4 primary labels every inode, a FUSE secondary has
+/// none. They are served from the primary and never compared; any other difference in the list still is.
+#[test]
+fn selinux_labels_are_not_compared() {
+    let h0 = prepared(B);
+    if !xattr_ok(&h0) {
+        eprintln!("SKIP: no user xattrs");
+        return;
+    }
+    for level in [B, T, P] {
+        let h = prepared(level);
+        h.setxattr("/f", "user.k", b"value").unwrap();
+        // the primary has a label, the secondary none
+        h.pfault.add(Fault::new(FaultOp::Listxattr, Effect::XattrListAdd(b"security.selinux".to_vec())));
+        h.pfault.add(Fault::new(FaultOp::Getxattr, Effect::XattrValue(b"system_u:object_r:user_tmp_t:s0".to_vec())).name("security.selinux"));
+        let list = h.listxattr("/f").unwrap();
+        assert!(list.contains(&"security.selinux".to_string()) && list.contains(&"user.k".to_string()), "{list:?}");
+        let ino = h.lookup("/f").id;
+        assert!(matches!(h.engine.listxattr(&h.ctx, ino, 0).unwrap(), xcheckfs::backend::XattrOut::Size(_)), "size probe");
+        assert_eq!(h.getxattr("/f", "security.selinux").unwrap(), b"system_u:object_r:user_tmp_t:s0");
+        h.assert_no_mismatches();
+        // another name missing on the secondary is still a difference
+        h.inject(Fault::new(FaultOp::Listxattr, Effect::XattrListDrop(b"user.k".to_vec())));
+        h.listxattr("/f").unwrap();
+        h.expect_mismatch(K::Xattr, Some("list"));
+    }
+}
+
 #[test]
 fn xattr_value_and_list_faults() {
     let h0 = prepared(B);

@@ -950,11 +950,11 @@ impl Backend for FaultBackend {
 
     fn getxattr(&self, node: BorrowedFd<'_>, name: &CStr, size: usize) -> SysResult<XattrOut> {
         self.exec(FaultOp::Getxattr, &[name.to_bytes()], Some(node), None, |fx| {
-            let r = self.inner.getxattr(node, name, size)?;
+            // (the value is returned even where the attribute does not exist)
             Ok(match fx.0.iter().find_map(|e| if let Effect::XattrValue(v) = e { Some(v) } else { None }) {
                 Some(v) if size == 0 => XattrOut::Size(v.len()),
                 Some(v) => XattrOut::Data(v.clone()),
-                None => r,
+                None => self.inner.getxattr(node, name, size)?,
             })
         })
     }
