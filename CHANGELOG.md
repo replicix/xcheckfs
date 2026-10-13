@@ -121,6 +121,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- False `attr` mismatches over a FUSE side right after a change: a
+  directory's `nlink` one subdirectory behind or ahead, its `mtime` and
+  `ctime` going back (stress runs over an experimental FUSE secondary on a
+  loaded host). Linux can answer a stat from attributes an operation
+  invalidated when the stat runs while another stat of the object installs
+  the fresh reply (mainline Linux 7.3: `fuse_change_attributes_common` clears the invalid mask
+  before it writes the attributes; `fuse_update_get_attr` reads both without
+  the inode's lock), and lookups and getattrs of one object run concurrently.
+  The lookups and getattrs after a change, until one succeeded on both sides,
+  and the stats of the `write mtime` and `fallocate` checks now use `statx(AT_STATX_FORCE_SYNC)`
+  ([Design](docs/explanation/DESIGN.md#lockstep-execution)). Tests: the fault
+  effect `CachedAttrs`, which models that cache.
 - A repair that replaces an object found by its path (an object of the wrong
   type) no longer attaches the object to the secondary of another one when an
   ancestor was renamed meanwhile: it fails, and the next operation on the

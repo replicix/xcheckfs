@@ -513,14 +513,23 @@ impl Engine {
                 _ => merged.push((s, x)),
             }
         }
-        LockSet {
+        let l = LockSet {
             _g: merged
                 .into_iter()
                 .map(|(s, x)| {
                     if x { Guard::W(self.stripes[s].write()) } else { Guard::R(self.stripes[s].read()) }
                 })
                 .collect(),
+        };
+        // Who holds an object exclusively may change it: its next stats go past the kernels' attribute caches
+        // (`Node::attrs_changed`). Marked once the lock is held, so that no stat of the old state, still running
+        // under a shared lock, can count as the fetch after the change.
+        for &(id, _) in ids.iter().filter(|(_, x)| *x) {
+            if let Some(n) = self.nodes.get(id) {
+                n.attrs_changed();
+            }
         }
+        l
     }
 
     // ---------------------------------------------------------------- creds

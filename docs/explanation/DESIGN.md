@@ -108,6 +108,29 @@ different orders), and a checker that cries wolf is useless.
   secondary on a helper thread of the calling thread, the primary on the
   calling thread), so an operation costs the slower side, not the sum. `--sequential` runs the
   secondary after the primary instead.
+- **Stats after a change go past the kernel's attribute cache.** The kernel
+  client of a FUSE file system caches attributes and invalidates them when an
+  operation through it changes the object, but it can still answer a stat
+  with the invalidated ones: when the stat runs while another stat of the
+  object installs the fresh reply (mainline Linux 7.3, `fs/fuse`:
+  `fuse_change_attributes_common` clears the invalid mask before it writes
+  the attributes, and `fuse_update_get_attr` reads both without the inode's
+  lock, so it can find the mask clear, the old cache time still valid, and
+  the old attributes). Lookups and getattrs of one object share its lock and
+  run concurrently, so over a FUSE side this showed as a directory's link
+  count one subdirectory behind or ahead of the other side, and its mtime and
+  ctime going back, right after a `mkdir`, `rmdir` or `rename` in it, while
+  the file system itself had answered every request correctly. Each node
+  therefore counts its changes (every operation that holds it exclusively,
+  every in-place write), and the lookups and getattrs after a change, until
+  one of them succeeded on both sides, use `statx(AT_STATX_FORCE_SYNC)`: the
+  file system's reply, never the cache. The cache was invalidated, so they
+  would have asked the file system anyway (unless the revalidation of a
+  lookup's name refreshed it first): this costs next to no requests, and a
+  local file system ignores the flag. A node the kernel forgets before such a
+  stat passes the mark to the object's next node, unless the object is gone
+  (link count 0). The stat of the `write mtime` check after a write and the
+  one after a `fallocate` at `thorough` go past the cache too.
 
 ## What an operation does
 

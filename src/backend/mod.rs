@@ -77,6 +77,12 @@ pub trait Backend: Send + Sync {
     fn stat_at(&self, dir: BorrowedFd<'_>, name: &CStr) -> SysResult<Stat>;
     /// Stats a node or an open file.
     fn stat(&self, fd: BorrowedFd<'_>) -> SysResult<Stat>;
+    /// [`Backend::lookup`] with the attributes fetched past the attribute cache of the file system's kernel client
+    /// (`statx(AT_STATX_FORCE_SYNC)`, see [`sys::fstat_sync`](crate::sys::fstat_sync)): what the file system
+    /// answers now, never what an earlier answer left cached.
+    fn lookup_fresh(&self, dir: BorrowedFd<'_>, name: &CStr) -> SysResult<(OwnedFd, Stat)>;
+    /// [`Backend::stat`] past the kernel's attribute cache, as [`Backend::lookup_fresh`].
+    fn stat_fresh(&self, fd: BorrowedFd<'_>) -> SysResult<Stat>;
 
     fn chmod(&self, node: BorrowedFd<'_>, kind: FileKind, mode: u32) -> SysResult<()>;
     fn chown(&self, node: BorrowedFd<'_>, uid: Option<u32>, gid: Option<u32>) -> SysResult<()>;

@@ -852,3 +852,97 @@ fn wrong_mtime_is_still_reported_with_a_small_tolerance() {
     h.getattr("/f");
     h.expect_mismatch(xcheckfs::policy::MismatchKind::Attr, Some("mtime"));
 }
+
+/// A FUSE side's kernel can answer a stat with attributes an operation through it invalidated: when the stat runs
+/// while another stat of the object installs the fresh ones (Linux 7.3, `fs/fuse`: `fuse_change_attributes_common`
+/// clears the invalid mask before it writes the attributes, and `fuse_update_get_attr` reads both without the
+/// inode's lock). Lookups and getattrs of one object run concurrently under its shared lock, so stress runs over a
+/// FUSE secondary saw `lookup attr nlink` of a directory one subdirectory behind or ahead, and a directory's mtime
+/// and ctime going back. [`Effect::CachedAttrs`] answers the secondary's stats of the objects below from such a
+/// cache, every time: the first stats after a change must go past it.
+#[test]
+fn stats_after_a_change_go_past_the_kernels_attribute_cache() {
+    use xcheckfs::backend::fault::{Effect, Fault, FaultOp};
+    for level in LEVELS {
+        for ser in SERS {
+            let h = Harness::builder().level(level).config(move |c| c.serialize = ser).build();
+            h.mkdir("/d");
+            h.mkdir("/e");
+            h.write_file("/d/f", &pattern(1, 10_000));
+            for path in ["/d", "/d/f"] {
+                h.fault.add(Fault::new(FaultOp::Lookup, Effect::CachedAttrs).path(path));
+                h.fault.add(Fault::new(FaultOp::Stat, Effect::CachedAttrs).path(path));
+            }
+            let d = h.lookup("/d");
+            h.getattr("/d/f");
+            let read_both = || {
+                for _ in 0..2 {
+                    h.lookup("/d");
+                    h.engine.getattr(&h.ctx, d.id).unwrap();
+                    h.getattr("/d/f");
+                }
+            };
+            // a directory's link count, mtime and ctime
+            h.mkdir("/d/s");
+            read_both();
+            h.rename("/e", "/d/e");
+            read_both();
+            h.rmdir("/d/s");
+            read_both();
+            h.rename("/d/e", "/e");
+            read_both();
+            // a file's size, mtime and ctime: a write that extends it (exclusive), one in place (shared under
+            // relaxed serialization), a mode change
+            let f = h.open("/d/f", libc::O_RDWR);
+            h.pwrite(f, 10_000, b"more");
+            read_both();
+            h.set_mtime("/d/f", 1_000_000).unwrap();
+            read_both();
+            h.pwrite(f, 100, b"in place");
+            read_both();
+            h.close(f);
+            h.setattr("/d/f", SetAttr { mode: Some(0o600), ..Default::default() }).unwrap();
+            read_both();
+            h.assert_no_mismatches();
+            assert!(h.fault.calls(FaultOp::Lookup) > 0);
+            h.assert_trees_equal();
+        }
+    }
+}
+
+/// The same for an object whose node the kernel forgot after the change and before any stat: its next node
+/// starts unfetched.
+#[test]
+fn a_node_forgotten_after_a_change_is_looked_up_past_the_attribute_cache() {
+    use xcheckfs::backend::fault::{Effect, Fault, FaultOp};
+    let h = Harness::basic();
+    h.mkdir("/d");
+    h.fault.add(Fault::new(FaultOp::Lookup, Effect::CachedAttrs).path("/d"));
+    h.fault.add(Fault::new(FaultOp::Stat, Effect::CachedAttrs).path("/d"));
+    let d = h.lookup("/d");
+    h.mkdir("/d/s");
+    h.engine.forget(d.id, u64::MAX >> 1);
+    h.lookup("/d");
+    h.lookup("/d");
+    h.getattr("/d");
+    h.assert_no_mismatches();
+}
+
+/// `--check thorough` requires both sides' mtime to be no older than a write's start: the stat that checks it
+/// comes right after the write invalidated the kernel's cached mtime, and under relaxed serialization other stats
+/// of the file may run at the same time.
+#[test]
+fn the_write_mtime_check_goes_past_the_kernels_attribute_cache() {
+    use xcheckfs::backend::fault::{Effect, Fault, FaultOp};
+    for ser in SERS {
+        let h = Harness::builder().level(CheckLevel::Thorough).config(move |c| c.serialize = ser).build();
+        h.write_file("/f", &pattern(2, 10_000));
+        h.set_mtime("/f", 1_000_000).unwrap();
+        h.fault.add(Fault::new(FaultOp::Stat, Effect::CachedAttrs).path("/f"));
+        let f = h.open("/f", libc::O_RDWR);
+        h.getattr("/f");
+        h.pwrite(f, 100, b"in place");
+        h.close(f);
+        h.assert_no_mismatches();
+    }
+}

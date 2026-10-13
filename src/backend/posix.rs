@@ -57,6 +57,12 @@ fn xattr_result(r: libc::ssize_t, mut buf: Vec<u8>, size: usize) -> SysResult<Xa
     }
 }
 
+/// `name` in `dir` as an O_PATH|O_NOFOLLOW descriptor.
+fn open_path(dir: BorrowedFd<'_>, name: &CStr) -> SysResult<OwnedFd> {
+    // SAFETY: valid fd and C string.
+    owned(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) })
+}
+
 impl Backend for PosixBackend {
     fn label(&self) -> &str {
         &self.label
@@ -67,14 +73,7 @@ impl Backend for PosixBackend {
     }
 
     fn lookup(&self, dir: BorrowedFd<'_>, name: &CStr) -> SysResult<(OwnedFd, Stat)> {
-        // SAFETY: valid fd and C string.
-        let fd = owned(unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        })?;
+        let fd = open_path(dir, name)?;
         let st = sys::fstat(fd.as_fd())?;
         Ok((fd, st))
     }
@@ -85,6 +84,16 @@ impl Backend for PosixBackend {
 
     fn stat(&self, fd: BorrowedFd<'_>) -> SysResult<Stat> {
         sys::fstat(fd)
+    }
+
+    fn lookup_fresh(&self, dir: BorrowedFd<'_>, name: &CStr) -> SysResult<(OwnedFd, Stat)> {
+        let fd = open_path(dir, name)?;
+        let st = sys::fstat_sync(fd.as_fd())?;
+        Ok((fd, st))
+    }
+
+    fn stat_fresh(&self, fd: BorrowedFd<'_>) -> SysResult<Stat> {
+        sys::fstat_sync(fd)
     }
 
     fn chmod(&self, node: BorrowedFd<'_>, kind: FileKind, mode: u32) -> SysResult<()> {

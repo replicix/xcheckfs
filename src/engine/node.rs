@@ -1,7 +1,7 @@
 //! The inode table: one [`Node`] per object the kernel knows about, holding
 //! an O_PATH descriptor on each backend.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use super::fds::CountedFd;
@@ -46,6 +46,11 @@ pub struct Node {
     pub ranges: super::ranges::RangeLocks,
     /// In-place data operations in flight (relaxed serialization).
     pub data: super::ranges::DataInFlight,
+    /// Changes to the object that leave a FUSE side's kernel holding attributes it invalidated: every operation
+    /// that holds the object exclusively, and every in-place write ([`Node::attrs_changed`]).
+    attr_changes: AtomicU64,
+    /// `attr_changes` when the last stat of the object past the kernels' attribute caches began.
+    attr_fetched: AtomicU64,
 }
 
 impl Node {
@@ -76,7 +81,36 @@ impl Node {
             locks: Mutex::new(LockState::default()),
             ranges: Default::default(),
             data: Default::default(),
+            attr_changes: AtomicU64::new(0),
+            attr_fetched: AtomicU64::new(0),
         }
+    }
+
+    /// The object changed, or may have: the kernel of a FUSE side invalidated the attributes it caches for it.
+    ///
+    /// Until a stat has fetched them again, such a kernel can still answer a stat with the old ones: when the stat
+    /// runs while another stat of the object installs the fresh attributes (mainline Linux 7.3, `fs/fuse`:
+    /// `fuse_change_attributes_common` clears the invalid mask before it writes the attributes, and
+    /// `fuse_update_get_attr` reads both without the inode's lock, so it can find the mask clear, the old cache
+    /// time still valid, and the old attributes). Concurrent stats of one object are routine here (lookups and
+    /// getattrs hold it shared), so the first stats after a change go past the caches ([`Node::attrs_unfetched`]).
+    pub fn attrs_changed(&self) {
+        self.attr_changes.fetch_add(1, SeqCst);
+    }
+
+    /// `Some(changes)` while a stat of the object must go past the kernels' attribute caches
+    /// ([`Backend::stat_fresh`](crate::backend::Backend::stat_fresh)): it changed since the last such stat began.
+    /// Pass `changes` to [`Node::attrs_fetched`] once that stat succeeded on both sides.
+    pub fn attrs_unfetched(&self) -> Option<u64> {
+        let changes = self.attr_changes.load(SeqCst);
+        (self.attr_fetched.load(SeqCst) != changes).then_some(changes)
+    }
+
+    /// A stat past the caches that began at `changes` ([`Node::attrs_unfetched`]) succeeded: the kernels hold
+    /// what it fetched (or what a later stat fetched), so later stats may be answered from their caches again,
+    /// unless the object changed meanwhile.
+    pub fn attrs_fetched(&self, changes: u64) {
+        self.attr_fetched.fetch_max(changes, SeqCst);
     }
 
     pub fn p(&self) -> BorrowedFd<'_> {
@@ -177,7 +211,48 @@ struct Inner {
     by_id: HashMap<u64, Arc<Node>>,
     /// Secondary identity -> node id, for hard-link structure checks.
     by_sec: HashMap<(u64, u64), u64>,
+    /// Ids of nodes removed while their attributes were unfetched ([`Node::attrs_unfetched`]): the object's next
+    /// node starts so. Objects that are gone (link count 0: removed, or replaced by a rename) are not recorded:
+    /// every one of them was held exclusively by its removal, and a workload that deletes much would otherwise
+    /// crowd out the live ones. At most [`UNFETCHED_CAP`] ids; beyond, the oldest mark is dropped (a stat of that
+    /// object may then be answered from a kernel's stale cache, as before these marks existed).
+    unfetched: Unfetched,
 }
+
+
+/// The marks of [`Inner::unfetched`], evicted oldest first.
+#[derive(Default)]
+struct Unfetched {
+    /// id -> the sequence number it was marked with
+    ids: HashMap<u64, u64>,
+    /// (sequence number, id) in marking order; entries of ids unmarked or marked again since are skipped
+    order: VecDeque<(u64, u64)>,
+    seq: u64,
+}
+
+impl Unfetched {
+    fn insert(&mut self, id: u64, cap: usize) {
+        self.seq += 1;
+        self.ids.insert(id, self.seq);
+        self.order.push_back((self.seq, id));
+        while self.ids.len() > cap || self.order.len() > 2 * cap {
+            let Some((seq, old)) = self.order.pop_front() else { break };
+            if self.ids.get(&old) == Some(&seq) {
+                self.ids.remove(&old);
+            }
+        }
+    }
+
+    fn remove(&mut self, id: u64) -> bool {
+        self.ids.remove(&id).is_some()
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        !self.ids.is_empty() && self.ids.contains_key(&id)
+    }
+}
+
+const UNFETCHED_CAP: usize = 1 << 16;
 
 #[derive(Default)]
 pub struct NodeTable {
@@ -218,6 +293,9 @@ impl NodeTable {
             return Inserted::Existing(x.clone());
         }
         n.nlookup.store(1, SeqCst);
+        if g.unfetched.remove(n.id) {
+            n.attrs_changed();
+        }
         if let Some(si) = n.sident() {
             g.by_sec.insert(si, n.id);
         }
@@ -259,11 +337,29 @@ impl NodeTable {
     }
 
     fn remove(g: &mut Inner, id: u64) {
-        if let Some(n) = g.by_id.remove(&id)
-            && let Some(si) = n.sident()
-                && g.by_sec.get(&si) == Some(&id) {
-                    g.by_sec.remove(&si);
-                }
+        let Some(n) = g.by_id.remove(&id) else { return };
+        if let Some(si) = n.sident()
+            && g.by_sec.get(&si) == Some(&id) {
+                g.by_sec.remove(&si);
+            }
+        // (an O_PATH descriptor of a removed object reports link count 0)
+        if n.attrs_unfetched().is_some() && crate::sys::fstat(n.p()).is_ok_and(|st| st.nlink > 0) {
+            g.unfetched.insert(id, UNFETCHED_CAP);
+        }
+    }
+
+    /// Whether the object with this id, which has no node, changed since its attributes were last fetched past the
+    /// kernels' caches (its node was removed before that).
+    pub fn unfetched(&self, id: u64) -> bool {
+        let g = self.inner.read();
+        g.unfetched.contains(id)
+    }
+
+    /// A stat past the caches of the object with this id, which has no node, succeeded.
+    pub fn fetched(&self, id: u64) {
+        if self.unfetched(id) {
+            self.inner.write().unfetched.remove(id);
+        }
     }
 
     /// Replaces (or removes, or attaches) the secondary object of a node.
@@ -283,5 +379,72 @@ impl NodeTable {
             *sec = Some(SecRef { fd: Arc::new(CountedFd::new(fd)), ident });
         }
         n.sec_gen.fetch_add(1, SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opath(p: &std::path::Path) -> OwnedFd {
+        let c = crate::sys::cstr(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid C string.
+        crate::sys::owned(unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }).unwrap()
+    }
+
+    /// A node of `fd`'s object under `id`, changed since its attributes were fetched, inserted and forgotten.
+    fn forget_changed(t: &NodeTable, id: u64, fd: &OwnedFd) {
+        let n = Arc::new(Node::new(id, FileKind::Dir, fd.try_clone().unwrap(), None, (0, id), None, "x".into()));
+        n.attrs_changed();
+        assert!(matches!(t.insert_or_get(n), Inserted::New(_)));
+        t.forget(id, 1);
+        assert!(t.get(id).is_none());
+    }
+
+    /// Every removed object was held exclusively by its removal: were they recorded, a workload that deletes more
+    /// than the cap would crowd out the marks of live directories (their stale link counts would be compared again).
+    #[test]
+    fn unfetched_marks_of_live_objects_survive_mass_deletion() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("live")).unwrap();
+        std::fs::write(d.path().join("gone"), b"").unwrap();
+        let live = opath(&d.path().join("live"));
+        let gone = opath(&d.path().join("gone"));
+        std::fs::remove_file(d.path().join("gone")).unwrap();
+        let t = NodeTable::default();
+        forget_changed(&t, 7, &live);
+        for id in 1000..1000 + UNFETCHED_CAP as u64 + 10 {
+            forget_changed(&t, id, &gone);
+            assert!(!t.unfetched(id), "a removed object is not recorded");
+        }
+        assert!(t.unfetched(7));
+        // and the object's next node starts unfetched
+        let n = Arc::new(Node::new(7, FileKind::Dir, live.try_clone().unwrap(), None, (0, 7), None, "x".into()));
+        assert!(matches!(t.insert_or_get(n.clone()), Inserted::New(_)));
+        assert!(n.attrs_unfetched().is_some());
+        assert!(!t.unfetched(7));
+    }
+
+    /// Beyond the cap the oldest marks go, one by one; a mark set again counts from then.
+    #[test]
+    fn unfetched_marks_are_evicted_oldest_first() {
+        let mut u = Unfetched::default();
+        for id in 0..4 {
+            u.insert(id, 4);
+        }
+        u.insert(0, 4); // 0 is now the newest
+        u.insert(4, 4);
+        assert!(!u.contains(1));
+        assert!([0, 2, 3, 4].iter().all(|&id| u.contains(id)));
+        assert!(u.remove(2));
+        for id in 5..7 {
+            u.insert(id, 4);
+        }
+        assert!(!u.contains(3) && u.contains(0) && u.contains(4) && u.contains(5) && u.contains(6));
+        for id in 100..10_000 {
+            u.insert(id, 4);
+            u.remove(id);
+        }
+        assert!(u.order.len() <= 8, "the order queue stays bounded");
     }
 }

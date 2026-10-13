@@ -41,6 +41,7 @@ impl Engine {
         sorted.sort_by_key(|r| (r.0.id, r.1));
         let mut guards = Vec::with_capacity(sorted.len());
         let mut inflight = Vec::new();
+        let mut written = Vec::new();
         let mut i = 0;
         while i < sorted.len() {
             // all the ranges of one object are one request (see `RangeLocks::lock_many`)
@@ -58,12 +59,13 @@ impl Engine {
                     self.stats.concurrent_data_ops.fetch_add(1, Relaxed);
                 }
                 inflight.push(d);
+                written.push(n);
                 // the stamps of this write may land anywhere in its window
                 Engine::touched_new(n.id);
             }
             i = j;
         }
-        DataLocks { _metas: metas, _ranges: guards, _inflight: inflight }
+        DataLocks { written, _inflight: inflight, _ranges: guards, _metas: metas }
     }
 
     /// The primary's current size through an open descriptor (stable while
@@ -365,11 +367,26 @@ impl Engine {
             let pn = self.node(parent)?;
             let c = cname(name)?;
             let (_l, cands) = self.lock_children(&[(parent, false)], &[(&pn, &c)], false);
-            cx.stat_snap = cands[0]
-                .and_then(|st| self.nodes.get(self.map_ino(st.ino)))
-                .map(|n| (n.id, n.data.snap()));
+            let id = cands[0].map(|st| self.map_ino(st.ino));
+            let known = id.and_then(|id| self.nodes.get(id));
+            cx.stat_snap = known.as_ref().map(|n| (n.id, n.data.snap()));
             let sec = self.sec_for(&[&pn]);
-            let (p, s) = self.both(cx, sec, None, |side, be| be.lookup(pn.fd(side).as_fd(), &c));
+            // After a change of the object, past the kernels' attribute caches (`Node::attrs_changed`).
+            let fresh = match &known {
+                Some(n) => n.attrs_unfetched(),
+                None => id.filter(|&id| self.nodes.unfetched(id)).map(|_| 0),
+            };
+            let (p, s) = self.both(cx, sec, None, |side, be| match fresh {
+                Some(_) => be.lookup_fresh(pn.fd(side).as_fd(), &c),
+                None => be.lookup(pn.fd(side).as_fd(), &c),
+            });
+            if let (Some(changes), true) = (fresh, p.is_ok() && s.as_ref().is_none_or(|r| r.is_ok())) {
+                match (&known, id) {
+                    (Some(n), _) => n.attrs_fetched(changes),
+                    (None, Some(id)) => self.nodes.fetched(id),
+                    (None, None) => {}
+                }
+            }
             self.cmp_result(cx, &pn, Some(name), &p, &s, false)?;
             let (pfd, pst) = p?;
             let s = s.and_then(|r| r.ok());
@@ -391,7 +408,15 @@ impl Engine {
             let _l = self.lock(&[(ino, false)]);
             let sec = self.sec_for(&[&n]);
             let snap = n.data.snap();
-            let (p, s) = self.both(cx, sec, None, |side, be| be.stat(n.fd(side).as_fd()));
+            // After a change of the object, past the kernels' attribute caches (`Node::attrs_changed`).
+            let fresh = n.attrs_unfetched();
+            let (p, s) = self.both(cx, sec, None, |side, be| match fresh {
+                Some(_) => be.stat_fresh(n.fd(side).as_fd()),
+                None => be.stat(n.fd(side).as_fd()),
+            });
+            if let (Some(changes), true) = (fresh, p.is_ok() && s.as_ref().is_none_or(|r| r.is_ok())) {
+                n.attrs_fetched(changes);
+            }
             self.cmp_result(cx, &n, None, &p, &s, false)?;
             let pst = p?;
             if let Some(Ok(sst)) = &s {
@@ -921,7 +946,10 @@ impl Engine {
                     // (file systems stamp with a coarse clock that lags the wall clock by up to a tick: a tolerance
                     // of nothing would report healthy file systems)
                     let tol = self.cfg.time_tolerance.max(std::time::Duration::from_millis(50)).as_nanos() as i128;
-                    let (a, b) = self.both(cx, true, None, |side, be| be.stat(f.fd(side).as_fd()));
+                    // Past the kernels' attribute caches: the write invalidated them, and a concurrent stat (an
+                    // in-place write holds the object shared) could otherwise leave this one the old mtime
+                    // (`Node::attrs_changed`).
+                    let (a, b) = self.both(cx, true, None, |side, be| be.stat_fresh(f.fd(side).as_fd()));
                     let chk = |r: SysResult<Stat>| match r {
                         Ok(st) if st.mtime.as_nanos() + tol >= started.as_nanos() => Ok(()),
                         Ok(st) => Err(format!("mtime {} not updated by the write at {started}", st.mtime)),
@@ -1034,7 +1062,8 @@ impl Engine {
             f.written.store(true, Relaxed);
             if self.thorough() && matches!(s, Some(Ok(()))) && n.has_sec() {
                 let snap = n.data.snap();
-                let (a, b) = self.both(cx, true, None, |side, be| be.stat(n.fd(side).as_fd()));
+                // Right after a change: past the kernels' attribute caches (`Node::attrs_changed`).
+                let (a, b) = self.both(cx, true, None, |side, be| be.stat_fresh(n.fd(side).as_fd()));
                 self.cmp_result(cx, n, None, &a, &b, true)?;
                 if let (Ok(a), Some(Ok(b))) = (a, b) {
                     self.cmp_stat_since(cx, n, &a, &b, true, "after fallocate", Some(snap))?;
@@ -1497,9 +1526,20 @@ fn sanitize_open_flags(flags: i32) -> i32 {
 /// Locks held by a data operation under relaxed serialization (dropped in
 /// reverse: in-flight marks, ranges, then the stripes).
 struct DataLocks<'a> {
+    /// The objects written in place: changed when the operation ends ([`Node::attrs_changed`]), while it still
+    /// counts as in flight, so that a stat between its write and this mark is a racy one.
+    written: Vec<&'a Node>,
     _inflight: Vec<super::ranges::DataOpGuard<'a>>,
     _ranges: Vec<super::ranges::RangeGuard<'a>>,
     _metas: LockSet<'a>,
+}
+
+impl Drop for DataLocks<'_> {
+    fn drop(&mut self) {
+        for n in &self.written {
+            n.attrs_changed();
+        }
+    }
 }
 
 /// Either the object exclusively (strict, or an operation that changes the

@@ -97,6 +97,14 @@ object, and added to the tolerance of its mtime and ctime checks. A slow
 experimental file system therefore never causes timestamp false positives;
 it only loosens timestamp checks for the objects it was slow on.
 
+**After a change.** The lookups and getattrs of an object after an operation
+changed it (held it exclusively, or wrote to it in place) stat it past the
+kernel's attribute cache (`statx(AT_STATX_FORCE_SYNC)`) until one of them
+succeeded on both sides, as do the `write mtime` check below and the stat
+after a `fallocate` at `thorough`: a FUSE side's kernel can otherwise answer
+one of several concurrent stats with the attributes from before the change
+([Design](../explanation/DESIGN.md#lockstep-execution)).
+
 ## Aligned mtime
 
 Some operations stamp `mtime` on one file system and not on another, and

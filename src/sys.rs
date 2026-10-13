@@ -191,6 +191,25 @@ impl Stat {
             ctime: Ts { sec: s.st_ctime, nsec: s.st_ctime_nsec as u32 },
         }
     }
+    /// The same fields from a `statx` buffer (`STATX_BASIC_STATS`), device numbers encoded as `fstat` encodes them.
+    pub fn from_statx(s: &libc::statx) -> Stat {
+        let ts = |t: &libc::statx_timestamp| Ts { sec: t.tv_sec, nsec: t.tv_nsec };
+        Stat {
+            dev: libc::makedev(s.stx_dev_major, s.stx_dev_minor),
+            ino: s.stx_ino,
+            mode: u32::from(s.stx_mode),
+            nlink: u64::from(s.stx_nlink),
+            uid: s.stx_uid,
+            gid: s.stx_gid,
+            rdev: libc::makedev(s.stx_rdev_major, s.stx_rdev_minor),
+            size: s.stx_size,
+            blksize: u64::from(s.stx_blksize),
+            blocks: s.stx_blocks,
+            atime: ts(&s.stx_atime),
+            mtime: ts(&s.stx_mtime),
+            ctime: ts(&s.stx_ctime),
+        }
+    }
     pub fn kind(&self) -> FileKind {
         FileKind::from_mode(self.mode)
     }
@@ -214,6 +233,21 @@ pub fn fstatat(dir: BorrowedFd<'_>, name: &CStr, flags: i32) -> SysResult<Stat> 
 
 pub fn fstat(fd: BorrowedFd<'_>) -> SysResult<Stat> {
     fstatat(fd, EMPTY, libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW)
+}
+
+/// [`fstat`] past the attribute cache of the file system's kernel client: `statx` with `AT_STATX_FORCE_SYNC`. A
+/// FUSE file system is asked (`GETATTR`) whatever the kernel holds, and the result is its reply, never the
+/// cache; a local file system answers as to `fstat`. Without `statx` (`ENOSYS`), plain [`fstat`].
+pub fn fstat_sync(fd: BorrowedFd<'_>) -> SysResult<Stat> {
+    let mut st = std::mem::MaybeUninit::<libc::statx>::uninit();
+    let flags = libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_FORCE_SYNC;
+    // SAFETY: valid fd, valid C string, st is a valid out pointer.
+    match cvt(unsafe { libc::statx(fd.as_raw_fd(), EMPTY.as_ptr(), flags, libc::STATX_BASIC_STATS, st.as_mut_ptr()) }) {
+        // SAFETY: statx succeeded and initialised the buffer.
+        Ok(_) => Ok(Stat::from_statx(&unsafe { st.assume_init() })),
+        Err(libc::ENOSYS) => fstat(fd),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn cstr(bytes: &[u8]) -> SysResult<CString> {
@@ -452,4 +486,34 @@ pub fn signal_pending(tid: u32) -> bool {
 /// Reads the path an O_PATH descriptor currently refers to.
 pub fn fd_path(fd: BorrowedFd<'_>) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsFd;
+
+    fn opath(p: &std::path::Path) -> OwnedFd {
+        let c = cstr(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid C string.
+        owned(unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) }).unwrap()
+    }
+
+    /// The identity (device and inode numbers) of an object must come out the same either way: the engine compares
+    /// it with what it recorded from `fstat` (a mismatch refuses the node).
+    #[test]
+    fn fstat_sync_answers_what_fstat_answers() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("f"), b"twelve bytes").unwrap();
+        std::os::unix::fs::symlink("f", d.path().join("l")).unwrap();
+        let fifo = cstr(d.path().join("p").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid C string.
+        cvt(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }).unwrap();
+        for p in [d.path().to_path_buf(), d.path().join("f"), d.path().join("l"), d.path().join("p")] {
+            let fd = opath(&p);
+            let (a, b) = (fstat_sync(fd.as_fd()).unwrap(), fstat(fd.as_fd()).unwrap());
+            // (atime may move between the two calls on a relatime mount, and is never compared by the engine)
+            assert_eq!(Stat { atime: b.atime, ..a }, b, "{}", p.display());
+        }
+    }
 }

@@ -374,6 +374,13 @@ pub enum Effect {
     // ---- attributes
     /// stat / stat_at / lookup: falsify the returned attributes.
     Stat(StatLie),
+    /// stat / lookup: answer with the attributes this backend last returned for the object, as a FUSE file system's
+    /// kernel client can answer a stat from its attribute cache although an operation through it invalidated them:
+    /// when the stat runs while another one installs the fresh attributes (mainline Linux 7.3: `fuse_change_attributes_common`
+    /// clears the invalid mask before it writes the attributes, `fuse_update_get_attr` reads both without the
+    /// inode's lock). `stat_fresh` and `lookup_fresh` are never answered from it; they refresh it. Only objects
+    /// stat'ed since the first such fault was added are known to it.
+    CachedAttrs,
 
     // ---- directories and links
     /// readdir: hide the entry with this name.
@@ -470,6 +477,10 @@ pub struct FaultBackend {
     calls: Vec<AtomicU64>,
     rec: Recorder,
     times_lock: Mutex<()>,
+    /// What [`Effect::CachedAttrs`] answers: the attributes last returned per object (`dev`, `ino`); kept once
+    /// such a fault was added.
+    attr_cache: Mutex<HashMap<(u64, u64), Stat>>,
+    attr_cache_on: AtomicBool,
 }
 
 /// The effects that fired for one call.
@@ -517,6 +528,8 @@ impl FaultBackend {
             calls: FaultOp::ALL.iter().map(|_| AtomicU64::new(0)).collect(),
             rec: Recorder::default(),
             times_lock: Mutex::new(()),
+            attr_cache: Mutex::new(HashMap::new()),
+            attr_cache_on: AtomicBool::new(false),
         })
     }
 
@@ -527,6 +540,9 @@ impl FaultBackend {
     /// Adds a fault; it is active immediately, also for calls already running concurrently.
     pub fn add(&self, f: Fault) -> FaultId {
         let id = self.next_id.fetch_add(1, Relaxed);
+        if matches!(f.effect, Effect::CachedAttrs) {
+            self.attr_cache_on.store(true, Relaxed);
+        }
         self.faults.write().push(Arc::new(Entry { id, fault: f, matched: AtomicU64::new(0), hits: AtomicU64::new(0) }));
         FaultId(id)
     }
@@ -743,6 +759,43 @@ impl FaultBackend {
     }
 }
 
+impl FaultBackend {
+    /// The answer of a stat whose object stands at `st`: with [`Effect::CachedAttrs`], what the cache holds for
+    /// it; otherwise `st`, which the cache then holds.
+    fn cached(&self, fx: &Fx, st: Stat) -> Stat {
+        if !self.attr_cache_on.load(Relaxed) {
+            return st;
+        }
+        let mut cache = self.attr_cache.lock();
+        if fx.has(|e| matches!(e, Effect::CachedAttrs))
+            && let Some(old) = cache.get(&st.ident()) {
+                return *old;
+            }
+        cache.insert(st.ident(), st);
+        st
+    }
+
+    /// A stat past the cache: its answer is `st`, which the cache now holds.
+    fn fetched(&self, st: Stat) -> Stat {
+        if self.attr_cache_on.load(Relaxed) {
+            self.attr_cache.lock().insert(st.ident(), st);
+        }
+        st
+    }
+
+    /// The result `r` of a call whose reply carries the object's attributes, which a FUSE kernel then caches (a
+    /// `SETATTR`, a `LINK`): the cache holds the object's current ones. (Calls that only invalidate them, a write,
+    /// a rename, an entry added to or removed from a directory, leave the cache as it was.)
+    fn installs(&self, node: BorrowedFd<'_>, r: SysResult<()>) -> SysResult<()> {
+        if r.is_ok()
+            && self.attr_cache_on.load(Relaxed)
+            && let Ok(st) = self.inner.stat(node) {
+                self.attr_cache.lock().insert(st.ident(), st);
+            }
+        r
+    }
+}
+
 fn lie_stat(fx: &Fx, mut st: Stat) -> Stat {
     for l in fx.stat_lies() {
         l.apply(&mut st);
@@ -761,7 +814,13 @@ impl Backend for FaultBackend {
 
     fn lookup(&self, dir: BorrowedFd<'_>, name: &CStr) -> SysResult<(OwnedFd, Stat)> {
         self.exec(FaultOp::Lookup, &[name.to_bytes()], Some(dir), None, |fx| {
-            self.inner.lookup(dir, name).map(|(fd, st)| (fd, lie_stat(fx, st)))
+            self.inner.lookup(dir, name).map(|(fd, st)| (fd, lie_stat(fx, self.cached(fx, st))))
+        })
+    }
+
+    fn lookup_fresh(&self, dir: BorrowedFd<'_>, name: &CStr) -> SysResult<(OwnedFd, Stat)> {
+        self.exec(FaultOp::Lookup, &[name.to_bytes()], Some(dir), None, |fx| {
+            self.inner.lookup_fresh(dir, name).map(|(fd, st)| (fd, lie_stat(fx, self.fetched(st))))
         })
     }
 
@@ -772,20 +831,24 @@ impl Backend for FaultBackend {
     }
 
     fn stat(&self, fd: BorrowedFd<'_>) -> SysResult<Stat> {
-        self.exec(FaultOp::Stat, &[], Some(fd), None, |fx| self.inner.stat(fd).map(|st| lie_stat(fx, st)))
+        self.exec(FaultOp::Stat, &[], Some(fd), None, |fx| self.inner.stat(fd).map(|st| lie_stat(fx, self.cached(fx, st))))
+    }
+
+    fn stat_fresh(&self, fd: BorrowedFd<'_>) -> SysResult<Stat> {
+        self.exec(FaultOp::Stat, &[], Some(fd), None, |fx| self.inner.stat_fresh(fd).map(|st| lie_stat(fx, self.fetched(st))))
     }
 
     fn chmod(&self, node: BorrowedFd<'_>, kind: FileKind, mode: u32) -> SysResult<()> {
-        self.exec_unit(FaultOp::Chmod, &[], Some(node), |_| self.inner.chmod(node, kind, mode))
+        self.exec_unit(FaultOp::Chmod, &[], Some(node), |_| self.installs(node, self.inner.chmod(node, kind, mode)))
     }
 
     fn chown(&self, node: BorrowedFd<'_>, uid: Option<u32>, gid: Option<u32>) -> SysResult<()> {
-        self.exec_unit(FaultOp::Chown, &[], Some(node), |_| self.inner.chown(node, uid, gid))
+        self.exec_unit(FaultOp::Chown, &[], Some(node), |_| self.installs(node, self.inner.chown(node, uid, gid)))
     }
 
     fn truncate(&self, node: BorrowedFd<'_>, file: Option<BorrowedFd<'_>>, size: u64) -> SysResult<()> {
         self.exec_unit(FaultOp::Truncate, &[], Some(node), |fx| {
-            self.keeping_times(fx, node, file, || self.inner.truncate(node, file, size))
+            self.installs(node, self.keeping_times(fx, node, file, || self.inner.truncate(node, file, size)))
         })
     }
 
@@ -797,7 +860,7 @@ impl Backend for FaultBackend {
         atime: TimeSpec,
         mtime: TimeSpec,
     ) -> SysResult<()> {
-        self.exec_unit(FaultOp::Utimens, &[], Some(node), |_| self.inner.utimens(node, kind, file, atime, mtime))
+        self.exec_unit(FaultOp::Utimens, &[], Some(node), |_| self.installs(node, self.inner.utimens(node, kind, file, atime, mtime)))
     }
 
     fn readlink(&self, node: BorrowedFd<'_>) -> SysResult<Vec<u8>> {
@@ -855,7 +918,7 @@ impl Backend for FaultBackend {
     }
 
     fn link(&self, node: BorrowedFd<'_>, newdir: BorrowedFd<'_>, newname: &CStr) -> SysResult<()> {
-        self.exec_unit(FaultOp::Link, &[newname.to_bytes()], Some(node), |_| self.inner.link(node, newdir, newname))
+        self.exec_unit(FaultOp::Link, &[newname.to_bytes()], Some(node), |_| self.installs(node, self.inner.link(node, newdir, newname)))
     }
 
     fn open(&self, node: BorrowedFd<'_>, flags: i32) -> SysResult<OwnedFd> {

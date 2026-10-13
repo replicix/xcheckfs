@@ -101,6 +101,21 @@ By default the kernel caches attributes and directory entries for 1 s and
 serves repeated reads from its page cache. Operations answered from those
 caches never reach xcheckfs and are **not re-checked**.
 
+A FUSE side has an attribute cache of its own in its kernel client. xcheckfs
+compares what a stat there answers, as an application on that file system
+would see it, except for the lookups and getattrs right after an operation
+changed the object: those go past the cache (`statx(AT_STATX_FORCE_SYNC)`),
+because Linux can answer a stat that runs alongside another one with the
+attributes the change invalidated
+([Design](../explanation/DESIGN.md#lockstep-execution)).
+
+The flip side: the first lookup after a change compares the file system's
+`GETATTR` reply, not the attributes it put in its `LOOKUP` reply (the
+revalidation of the name). A FUSE file system whose `LOOKUP` replies carry
+stale attributes right after a change is therefore caught only by a later
+stat that the kernel answers from those cached `LOOKUP` attributes, not by
+the first one.
+
 For maximal coverage at a cost in speed, use
 `--attr-timeout 0 --entry-timeout 0 --direct-io all`. Direct I/O on every
 file needs kernel 6.7 or newer for shared writable `mmap` of those files;

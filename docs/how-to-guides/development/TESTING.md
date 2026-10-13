@@ -70,7 +70,12 @@ change against earlier results. Usage and the `results.json` format:
   system that makes a different legitimate choice: `StampMtime` (`rename`: a
   directory that moved to another parent, both for `RENAME_EXCHANGE`, gets its
   mtime set to now) and `RestoreTimes` (`pwrite`, `truncate`, `fallocate`: the
-  call happens, then atime and mtime are put back, ctime still moves).
+  call happens, then atime and mtime are put back, ctime still moves). One
+  models a FUSE kernel client: `CachedAttrs` (`stat`, `lookup`: answer with
+  the attributes last returned for the object, as Linux can answer a stat
+  that runs while another one installs fresh attributes; the `_fresh`
+  variants and calls whose reply carries attributes, `SETATTR` and `LINK`,
+  refresh it).
 - `Gate` (in `src/backend/fault.rs`, with the `Effect::Gate` fault and a
   recorder of calls in flight): holds the calls it is attached to inside a
   backend until the test opens it. Tests wait for calls to arrive and to
