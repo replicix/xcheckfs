@@ -187,6 +187,13 @@ pub fn diff_data(base_off: u64, p: &[u8], s: &[u8]) -> Option<String> {
     ))
 }
 
+/// Extended attributes that the security policy assigns per mount instead of the file system keeping them: SELinux
+/// labels. A FUSE secondary, for one, has none where an ext4 primary labels every inode. They are read, set and
+/// removed on the primary only, never repaired, and left out of every comparison (live, after a repair, `verify`).
+pub fn policy_xattr(name: &[u8]) -> bool {
+    name == b"security.selinux"
+}
+
 /// Splits a listxattr buffer into sorted names.
 pub fn xattr_names(buf: &[u8]) -> Vec<&[u8]> {
     let mut v: Vec<&[u8]> = buf.split(|&b| b == 0).filter(|n| !n.is_empty()).collect();

@@ -778,8 +778,9 @@ impl Engine {
         let (p, s) = (self.p(), self.s());
         let kind = pst.kind();
         if let (Ok(XattrOut::Data(pl)), Ok(XattrOut::Data(sl))) = (p.listxattr(pfd, XATTR_MAX), s.listxattr(sfd, XATTR_MAX)) {
-            let pn = compare::xattr_names(&pl);
-            for name in compare::xattr_names(&sl) {
+            // (labels are the policy's, on either side: not copied, not removed)
+            let pn: Vec<&[u8]> = compare::xattr_names(&pl).into_iter().filter(|n| !compare::policy_xattr(n)).collect();
+            for name in compare::xattr_names(&sl).into_iter().filter(|n| !compare::policy_xattr(n)) {
                 if !pn.contains(&name)
                     && let Ok(c) = crate::sys::cstr(name) {
                         let _ = s.removexattr(sfd, &c);
@@ -827,7 +828,9 @@ impl Engine {
             _ => {}
         }
         let names = |be: &dyn Backend, fd| match be.listxattr(fd, XATTR_MAX) {
-            Ok(XattrOut::Data(v)) => compare::xattr_names(&v).into_iter().map(<[u8]>::to_vec).collect::<Vec<_>>(),
+            Ok(XattrOut::Data(v)) => {
+                compare::xattr_names(&v).into_iter().filter(|n| !compare::policy_xattr(n)).map(<[u8]>::to_vec).collect::<Vec<_>>()
+            }
             _ => Vec::new(),
         };
         if names(self.p(), pfd) != names(self.s(), sfd) {

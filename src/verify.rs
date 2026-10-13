@@ -344,7 +344,7 @@ impl Ctx<'_> {
         // SELinux labels are assigned by the policy for each mount, not kept by the file system: two healthy
         // file systems mounted with different contexts label the same files differently.
         let labels = |mut v: Vec<(Vec<u8>, Vec<u8>)>| {
-            v.retain(|(n, _)| n != b"security.selinux");
+            v.retain(|(n, _)| !compare::policy_xattr(n));
             v
         };
         let (pa, sa) = match (read_xattrs(pp).map(labels), read_xattrs(sp).map(labels)) {

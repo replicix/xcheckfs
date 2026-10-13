@@ -187,6 +187,25 @@ fn read_through(h: &Harness, path: &str) -> Vec<u8> {
 // 1. Object repairs
 // =================================================================================================================
 
+/// A primary with SELinux labels and a secondary without (a FUSE file system): labels are the policy's, so the
+/// repair neither copies them nor counts them in its verification.
+#[test]
+fn repair_ignores_selinux_labels() {
+    let h = rs().build_with(|p, s| {
+        write(p, "f", b"hi");
+        write(s, "f", b"hi");
+        std::fs::set_permissions(p.join("f"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    });
+    h.pfault.add(Fault::new(FaultOp::Listxattr, Effect::XattrListAdd(b"security.selinux".to_vec())));
+    h.pfault.add(Fault::new(FaultOp::Getxattr, Effect::XattrValue(b"system_u:object_r:user_tmp_t:s0".to_vec())).name("security.selinux"));
+    let c0 = cnt(&h);
+    h.lookup("/f");
+    h.expect_mismatch(K::Attr, Some("mode"));
+    assert_repaired_once(&h, c0);
+    assert_eq!(std::fs::metadata(h.s_path("f")).unwrap().permissions().mode() & 0o7777, 0o640);
+    h.assert_trees_equal();
+}
+
 #[test]
 fn object_corrupted_content_is_repaired_on_read() {
     let content = data(1, 300_000);

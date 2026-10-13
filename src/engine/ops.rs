@@ -20,14 +20,7 @@ use crate::sys::{self, FileKind, Stat, SysResult};
 const VERIFY_CAP: u64 = 16 << 20;
 const XATTR_MAX: usize = 65536;
 
-/// Extended attributes that the security policy assigns per mount instead of the file system keeping them: SELinux
-/// labels. A FUSE secondary, for one, has none where an ext4 primary labels every inode. They are read, set and
-/// removed on the primary only and left out of every comparison (as `verify` does).
-const POLICY_XATTRS: &[&[u8]] = &[b"security.selinux"];
-
-fn policy_xattr(name: &[u8]) -> bool {
-    POLICY_XATTRS.contains(&name)
-}
+use compare::policy_xattr;
 
 impl Engine {
     // ------------------------------------------------------------- helpers
