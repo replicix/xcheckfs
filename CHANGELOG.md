@@ -62,6 +62,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `StampMtime`, `RestoreTimes` for truncate and `fallocate`, and
   `HarnessBuilder::secondary_fault`.
 
+- The mount-time probe also checks POSIX ACL support and lists a side without
+  it (`system.posix_acl_*` answering `EOPNOTSUPP`) as a capability gap, with
+  the allow rules that accept it.
+
 ### Changed
 
 - Directory link counts of a btrfs side are now found by the probe, for any

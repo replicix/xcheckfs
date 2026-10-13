@@ -158,6 +158,24 @@ fn same_file_systems_need_no_adaptation() {
     h.assert_no_mismatches();
 }
 
+/// A secondary without POSIX ACLs (a FUSE file system that does not enable them) is listed as a capability gap.
+#[test]
+fn missing_posix_acls_are_listed() {
+    let plain = Harness::builder().build();
+    let probe = |h: &Harness| h.engine.capability_gaps().join("\n");
+    if probe(&plain).contains("POSIX ACLs") {
+        eprintln!("SKIP: the two test trees already differ in POSIX ACL support");
+        return;
+    }
+    let h = rig(true, Fault::new(FaultOp::Getxattr, Effect::Errno(libc::EOPNOTSUPP)).name("system.posix_acl_access"));
+    let gaps = probe(&h);
+    if !gaps.contains("POSIX ACLs") {
+        eprintln!("SKIP: the primary's file system has no POSIX ACLs either");
+        return;
+    }
+    assert!(gaps.contains("secondary does not support POSIX ACLs") && gaps.contains("op = \"getxattr\""), "{gaps}");
+}
+
 /// An operation only the primary supports is listed with the allow rule that accepts it.
 #[test]
 fn missing_fallocate_modes_are_listed() {

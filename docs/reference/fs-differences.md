@@ -111,6 +111,7 @@ allowed automatically: whether the gap is acceptable is for you to decide.
 |---|---|---|
 | ext4 stores all xattrs of an inode in one block (about 4 KiB by default): more or larger values fail with `ENOSPC`, where xfs, btrfs and tmpfs succeed. | `setxattr` `result` (`ENOSPC` vs `OK`), then `listxattr` `xattr list` | `{ op = "setxattr", kind = "result", primary = "OK", secondary = "ENOSPC" }` (ext4 as secondary) |
 | tmpfs does not support `FALLOC_FL_ZERO_RANGE` (listed by the mount as a capability gap). | `fallocate` `result` (`OK` vs `EOPNOTSUPP`), then `read` `data` of that range | `{ op = "fallocate", kind = "result", secondary = "EOPNOTSUPP" }` (tmpfs as secondary) |
+| A file system without POSIX ACLs (an experimental FUSE file system that refuses the `system.*` xattr namespace) answers `getxattr` of `system.posix_acl_access`/`_default` with `EOPNOTSUPP` where ext4 answers `ENODATA` (no ACL); tools that read ACLs (`rsync -A`, libacl) issue those calls for every file and directory. Listed by the mount as a capability gap. | `getxattr` `result` (`ENODATA` vs `EOPNOTSUPP`); setting an ACL: `setxattr` `result` | `{ op = "getxattr", kind = "result", secondary = "EOPNOTSUPP" }` and `{ op = "setxattr", kind = "result", secondary = "EOPNOTSUPP" }` |
 
 Swap `primary` and `secondary` in the rule when the limited file system is
 the primary.

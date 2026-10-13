@@ -38,6 +38,9 @@ pub struct Behavior {
     pub punch_hole_in_hole_mtime: Option<bool>,
     /// Supported `fallocate` modes.
     pub fallocate: FallocModes,
+    /// POSIX ACLs (`system.posix_acl_*` xattrs): reading the access ACL of a file without one answers `ENODATA`
+    /// where they are supported, `EOPNOTSUPP` where not (a FUSE file system that does not enable them).
+    pub posix_acl: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -161,7 +164,7 @@ pub fn capability_gaps(p: &Behavior, s: &Behavior) -> Vec<String> {
         ("FALLOC_FL_COLLAPSE_RANGE", p.fallocate.collapse_range, s.fallocate.collapse_range),
         ("FALLOC_FL_INSERT_RANGE", p.fallocate.insert_range, s.fallocate.insert_range),
     ];
-    modes
+    let mut gaps: Vec<String> = modes
         .iter()
         .filter_map(|&(mode, a, b)| match (a, b) {
             (Some(true), Some(false)) => Some(format!(
@@ -174,7 +177,21 @@ pub fn capability_gaps(p: &Behavior, s: &Behavior) -> Vec<String> {
             )),
             _ => None,
         })
-        .collect()
+        .collect();
+    let acl = |side: &str, field: &str| {
+        format!(
+            "the {side} does not support POSIX ACLs (the other side does): getxattr of system.posix_acl_* answers \
+             EOPNOTSUPP there instead of ENODATA, and setting an ACL fails there; to accept that: \
+             {{ op = \"getxattr\", kind = \"result\", {field} = \"EOPNOTSUPP\" }} and \
+             {{ op = \"setxattr\", kind = \"result\", {field} = \"EOPNOTSUPP\" }}"
+        )
+    };
+    match (p.posix_acl, s.posix_acl) {
+        (Some(true), Some(false)) => gaps.push(acl("secondary", "secondary")),
+        (Some(false), Some(true)) => gaps.push(acl("primary", "primary")),
+        _ => {}
+    }
+    gaps
 }
 
 /// Probes the file system of `be` in a scratch directory at its root, which
@@ -219,7 +236,17 @@ fn run(be: &dyn Backend, d: BorrowedFd<'_>) -> Behavior {
         collapse_range: falloc_supported(be, d, "fc", libc::FALLOC_FL_COLLAPSE_RANGE),
         insert_range: falloc_supported(be, d, "fi", libc::FALLOC_FL_INSERT_RANGE),
     };
+    b.posix_acl = posix_acl(be, d);
     b
+}
+
+fn posix_acl(be: &dyn Backend, d: BorrowedFd<'_>) -> Option<bool> {
+    let (node, _) = file(be, d, "acl", 0).ok()?;
+    match be.getxattr(node.as_fd(), &cs("system.posix_acl_access"), 0) {
+        Ok(_) | Err(libc::ENODATA) => Some(true),
+        Err(libc::EOPNOTSUPP) => Some(false),
+        Err(_) => None,
+    }
 }
 
 fn sub(be: &dyn Backend, d: BorrowedFd<'_>, name: &str) -> SysResult<OwnedFd> {
@@ -339,5 +366,10 @@ mod tests {
         assert_eq!(g.len(), 1);
         assert!(g[0].contains("ZERO_RANGE") && g[0].contains("secondary = \"EOPNOTSUPP\""));
         assert!(capability_gaps(&p, &p).is_empty());
+        let p = Behavior { posix_acl: Some(true), ..Default::default() };
+        let s = Behavior { posix_acl: Some(false), ..Default::default() };
+        let g = capability_gaps(&p, &s);
+        assert_eq!(g.len(), 1);
+        assert!(g[0].contains("POSIX ACLs") && g[0].contains("op = \"getxattr\"") && g[0].contains("secondary = \"EOPNOTSUPP\""));
     }
 }
