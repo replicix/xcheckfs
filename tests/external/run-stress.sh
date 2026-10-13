@@ -19,6 +19,9 @@
 #   STRESS_TIMEOUT   seconds each stress-ng stressor runs (default 10)
 #   FIO_TIMEOUT      hard limit in seconds for each fio job (default 300)
 #   STRESS_FIO       0: skip the fio part
+#   STRESS_FIO_ONLY  space separated fio job names (seq rand shared sepfiles mixed mmapjob direct directrand fsync):
+#                    run only these
+#   STRESS_FIO_SKIP  space separated fio job names: do not run these
 #   STRESS_NG        0: skip the stress-ng part
 #   STRESS_NG_ONLY   space separated stressor names: run only these
 #   STRESS_NG_SKIP   space separated stressor names: do not run these
@@ -155,6 +158,26 @@ bounded() {
 
 ctl() { bounded 30 "$bin" ctl "$mnt" "$@"; }
 
+# bounded_job SECS CMD...: like bounded, for a load stage. A job that only ran out of time on a mount that still
+# answers is reported as a timeout (124) and the connection is left alone: a slow secondary is not a hung one, and
+# the stages after it still run. The connection is aborted only when the mount does not answer either.
+bounded_job() {
+    local secs=$1 rc
+    shift
+    timeout -k 5 "$secs" "$@"
+    rc=$?
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+        if timeout -k 2 30 stat "$mnt/." > /dev/null 2>&1; then
+            echo "!! TIMEOUT after ${secs}s (the mount still answers): $*" >&2
+        else
+            echo "!! TIMEOUT after ${secs}s, and the mount does not answer: $*" >&2
+            abort_conn
+        fi
+        return 124
+    fi
+    return "$rc"
+}
+
 # status_field NAME: a numeric field of the status object
 status_field() {
     ctl status 2>/dev/null | grep -o "\"$1\": *[0-9]*" | grep -o '[0-9]*$'
@@ -222,7 +245,7 @@ total_start=$(date +%s)
 fio_job() {
     local name=$1
     shift
-    bounded "$fio_secs" fio --name="$name" --directory="$mnt/fio" --size="$size" --verify_fatal=1 --do_verify=1 --verify_state_save=0 \
+    bounded_job "$fio_secs" fio --name="$name" --directory="$mnt/fio" --size="$size" --verify_fatal=1 --do_verify=1 --verify_state_save=0 \
         --group_reporting --output-format=terse --terse-version=3 --eta=never "$@" > "$base/fio-$name.out" 2>&1
     local rc=$?
     if [ "$rc" != 0 ]; then
@@ -232,21 +255,39 @@ fio_job() {
     return "$rc"
 }
 
+fio_wanted() {
+    local n=$1 s
+    if [ -n "${STRESS_FIO_ONLY:-}" ]; then
+        for s in $STRESS_FIO_ONLY; do [ "$s" = "$n" ] && return 0; done
+        return 1
+    fi
+    for s in ${STRESS_FIO_SKIP:-}; do [ "$s" = "$n" ] && return 1; done
+    return 0
+}
+
+# fio_stage LABEL NAME ARGS...: a fio job as a stage, unless STRESS_FIO_ONLY/STRESS_FIO_SKIP leave it out.
+fio_stage() {
+    local label=$1
+    shift
+    fio_wanted "$1" || { echo "== skipping fio $1"; return 0; }
+    stage "$label" fio_job "$@"
+}
+
 run_fio() {
     mkdir -p "$mnt/fio"
-    stage "fio sequential write+verify sha1" fio_job seq --rw=write --bs=128k --verify=sha1
-    stage "fio random 4k-256k write+verify" fio_job rand --rw=randwrite --bsrange=4k-256k --verify=crc32c --randrepeat=0
+    fio_stage "fio sequential write+verify sha1" seq --rw=write --bs=128k --verify=sha1
+    fio_stage "fio random 4k-256k write+verify" rand --rw=randwrite --bsrange=4k-256k --verify=crc32c --randrepeat=0
     # Two writers into disjoint halves of one file (the file is twice $size), plus a reader verifying afterwards.
-    stage "fio 2 concurrent writers+verify" fio_job shared --filename=shared.dat --rw=randwrite \
+    fio_stage "fio 2 concurrent writers+verify" shared --filename=shared.dat --rw=randwrite \
         --bsrange=4k-64k --verify=sha1 --numjobs=2 --offset_increment="$size" --randrepeat=0
-    stage "fio 2 writers, separate files" fio_job sepfiles --rw=write --bs=64k --verify=crc32c --numjobs=2 --new_group
-    stage "fio mixed randrw verify" fio_job mixed --rw=randrw --rwmixread=60 --bsrange=4k-128k --verify=crc32c \
+    fio_stage "fio 2 writers, separate files" sepfiles --rw=write --bs=64k --verify=crc32c --numjobs=2 --new_group
+    fio_stage "fio mixed randrw verify" mixed --rw=randrw --rwmixread=60 --bsrange=4k-128k --verify=crc32c \
         --verify_backlog=32 --randrepeat=0 --ioengine=psync
-    stage "fio mmap engine write+verify" fio_job mmapjob --ioengine=mmap --rw=randwrite --bs=16k --verify=crc32c --randrepeat=0
-    stage "fio direct=1 write+verify" fio_job direct --direct=1 --rw=write --bs=64k --verify=sha1
-    stage "fio direct=1 random write+verify" fio_job directrand --direct=1 --rw=randwrite --bsrange=4k-64k --verify=crc32c \
+    fio_stage "fio mmap engine write+verify" mmapjob --ioengine=mmap --rw=randwrite --bs=16k --verify=crc32c --randrepeat=0
+    fio_stage "fio direct=1 write+verify" direct --direct=1 --rw=write --bs=64k --verify=sha1
+    fio_stage "fio direct=1 random write+verify" directrand --direct=1 --rw=randwrite --bsrange=4k-64k --verify=crc32c \
         --randrepeat=0
-    stage "fio overwrite+fsync+verify" fio_job fsync --rw=randwrite --bs=8k --verify=crc32c --fsync=16 --randrepeat=0 \
+    fio_stage "fio overwrite+fsync+verify" fsync --rw=randwrite --bs=8k --verify=crc32c --fsync=16 --randrepeat=0 \
         --size="$size"
 }
 
@@ -318,7 +359,7 @@ ng_run() {
     shift
     [ "$name" = "$noverify" ] && verify=
     # shellcheck disable=SC2086
-    bounded $((ng_secs + 120)) stress-ng --"$name" "$workers" --timeout "${ng_secs}s" $verify --temp-path "$mnt/stress-ng" \
+    bounded_job $((ng_secs + 120)) stress-ng --"$name" "$workers" --timeout "${ng_secs}s" $verify --temp-path "$mnt/stress-ng" \
         --metrics --times "$@" > "$base/stress-ng-$name.out" 2>&1
     rc=$?
     case "$rc" in
@@ -351,7 +392,7 @@ run_ng() {
     if ng_wanted mix; then
         local mixargs=(--dentry 2 --rename 2 --link 1 --symlink 1 --hdd 2 --hdd-bytes "$size" --lockf 2)
         ng_wanted xattr && mixargs+=(--xattr 2)
-        stage "stress-ng mix" bounded $((ng_secs + 120)) stress-ng "${mixargs[@]}" --timeout "$((ng_secs * 2))s" --verify \
+        stage "stress-ng mix" bounded_job $((ng_secs + 120)) stress-ng "${mixargs[@]}" --timeout "$((ng_secs * 2))s" --verify \
             --temp-path "$mnt/stress-ng" --metrics
     fi
     rm -rf "${mnt:?}/stress-ng" 2>/dev/null
