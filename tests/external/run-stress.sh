@@ -18,6 +18,9 @@
 #   STRESS_SIZE      size of each fio data set (default 32M)
 #   STRESS_TIMEOUT   seconds each stress-ng stressor runs (default 10)
 #   FIO_TIMEOUT      hard limit in seconds for each fio job (default 300)
+#   FIO_FSYNC_IO     how much the fsync job writes (default 8M; its random 8k writes with an fsync every 16 cost a
+#                    whole-chunk publish per fsync on some file systems, so it is capped by volume, which keeps the
+#                    read-back verification: a runtime cap would end the job before it verifies)
 #   STRESS_FIO       0: skip the fio part
 #   STRESS_FIO_ONLY  space separated fio job names (seq rand shared sepfiles mixed mmapjob direct directrand fsync):
 #                    run only these
@@ -289,7 +292,7 @@ run_fio() {
     fio_stage "fio direct=1 random write+verify" directrand --direct=1 --rw=randwrite --bsrange=4k-64k --verify=crc32c \
         --randrepeat=0
     fio_stage "fio overwrite+fsync+verify" fsync --rw=randwrite --bs=8k --verify=crc32c --fsync=16 --randrepeat=0 \
-        --size="$size"
+        --size="$size" --io_size="${FIO_FSYNC_IO:-8M}"
 }
 
 # -- stress-ng -----------------------------------------------------------------------------------------------------
