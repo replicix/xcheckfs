@@ -46,7 +46,7 @@ jobs:
       - name: Build
         run: cargo build --locked --release --target x86_64-unknown-linux-musl
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: xcheckfs-static
           path: target/x86_64-unknown-linux-musl/release/xcheckfs
@@ -101,7 +101,7 @@ jobs:
 
       - name: Upload results and logs
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: apps-${{ matrix.app }}
           path: out/${{ matrix.app }}
@@ -178,7 +178,7 @@ jobs:
       # Results of main, for the pull requests to compare with.
       - name: Keep the results of main
         if: always() && github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: apps-results
           path: results/*/results.json
