@@ -89,7 +89,7 @@ jobs:
           cargo generate-rpm --target "$t" --profile dist -o out/
           ls -l out
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
           path: out/*
