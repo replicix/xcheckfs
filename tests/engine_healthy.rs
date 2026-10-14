@@ -842,6 +842,114 @@ fn slow_secondary_does_not_cause_timestamp_mismatches() {
     h.assert_no_mismatches();
 }
 
+/// A stat that waited for a slow operation runs the moment the operation lets go of the object, while the
+/// operation itself still runs (here: it repairs another object it found wrong): the object's times are compared with
+/// that operation's window already. (The slack used to be recorded only when the operation returned, and such a stat
+/// reported the secondary's mtime, stamped at the end of its slow half, as ahead of the primary's: `/`, `/a` in stress
+/// runs over a loaded experimental secondary.)
+#[test]
+fn a_stat_right_after_a_slow_operation_allows_for_its_window() {
+    use std::time::Duration;
+    use xcheckfs::backend::fault::{Effect, Fault, FaultOp, Gate, StatLie};
+    let h = Arc::new(
+        Harness::builder()
+            .mode(MismatchMode::Resync)
+            .config(|c| c.time_tolerance = Duration::from_millis(100))
+            .build(),
+    );
+    h.mkdir("/d");
+    // The secondary creates /d/x, stamping /d, 400 ms after the primary...
+    h.fault.add(Fault::new(FaultOp::Mkdir, Effect::Delay(Duration::from_millis(400))));
+    // ...and gives it a wrong mode: the mkdir repairs /d/x once it let go of /d, and is held in that repair.
+    h.fault.add(Fault::new(FaultOp::Lookup, Effect::Stat(StatLie::Mode(0o700))).path("/d/x").once());
+    let gate = Gate::new();
+    h.fault.add(Fault::new(FaultOp::Stat, Effect::Gate(gate.clone())).path("/d/x").once());
+    let mkdir = {
+        let h = h.clone();
+        std::thread::spawn(move || h.mkdir("/d/x"))
+    };
+    assert!(gate.wait_arrived(1, Duration::from_secs(20)), "the mkdir's repair never came");
+    h.getattr("/d");
+    gate.open();
+    mkdir.join().unwrap();
+    let late: Vec<_> = h.mismatches().into_iter().filter(|m| m.path == "/d").map(|m| m.summary()).collect();
+    assert!(late.is_empty(), "{late:#?}");
+}
+
+/// A node a slow operation created can be found (and stat'ed) before the operation returns: the operation does not
+/// hold it. Its times may lie anywhere in the operation's window, so they are compared with it.
+#[test]
+fn a_stat_of_an_object_a_slow_create_just_made_allows_for_its_window() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::Duration;
+    use xcheckfs::backend::fault::{Effect, Fault, FaultOp, Gate};
+    let h = Arc::new(
+        Harness::builder()
+            .level(CheckLevel::Paranoid)
+            .config(|c| c.time_tolerance = Duration::from_millis(100))
+            .build(),
+    );
+    h.mkdir("/d");
+    // The secondary creates /d/x 400 ms after the primary, and the mkdir is then held in its listing of /d (the
+    // paranoid `parent after create` comparison), after the node of /d/x is known.
+    h.fault.add(Fault::new(FaultOp::Mkdir, Effect::Delay(Duration::from_millis(400))));
+    let gate = Gate::new();
+    h.fault.add(Fault::new(FaultOp::Readdir, Effect::Gate(gate.clone())).path("/d").once());
+    let mkdir = {
+        let h = h.clone();
+        std::thread::spawn(move || h.mkdir("/d/x"))
+    };
+    assert!(gate.wait_arrived(1, Duration::from_secs(20)), "the mkdir's listing never came");
+    let ino = std::fs::symlink_metadata(h.p_path("/d/x")).unwrap().ino();
+    h.engine.getattr(&h.ctx, ino).unwrap();
+    gate.open();
+    mkdir.join().unwrap();
+    h.assert_no_mismatches();
+}
+
+/// The trees compared behind the engine's back allow for the same slack: a write whose secondary half took longer
+/// than their 2 s mtime tolerance leaves the file's mtimes that far apart.
+#[test]
+fn trees_compared_after_a_slow_write_allow_for_its_window() {
+    use std::time::Duration;
+    use xcheckfs::backend::fault::{Effect, Fault, FaultOp};
+    let h = Harness::basic();
+    h.write_file("/f", b"x");
+    h.fault.add(Fault::new(FaultOp::Pwrite, Effect::Delay(Duration::from_millis(3200))));
+    h.write_file("/f", b"y");
+    h.fault.clear();
+    h.assert_no_mismatches();
+    // (without the slack the mtimes are too far apart: the test means something)
+    let raw = tree_diff(h.p_root(), h.s_root(), &TreeOpts::default());
+    assert!(raw.iter().any(|d| d.starts_with("/f: mtime")), "{raw:?}");
+    h.assert_trees_equal();
+}
+
+/// The harness's own changes to the two trees happen behind the engine's back, one tree after the other: creating
+/// and seeding them, and probing the roots for xattrs. They must not leave the secondary's directories an mtime as much
+/// later as the secondary was slow, which the mount and the first stat of each compare (stress runs over a loaded
+/// experimental secondary: `/` 1.4 to 2.5 s ahead, at the start of a run).
+#[test]
+fn the_harness_leaves_the_roots_with_equal_times() {
+    let slow = std::time::Duration::from_millis(1200);
+    let h = Harness::builder().build_with(|p, s| {
+        let make = |r: &std::path::Path| {
+            std::fs::create_dir_all(r.join("d/e")).unwrap();
+            std::fs::write(r.join("d/f"), b"x").unwrap();
+        };
+        make(p);
+        std::thread::sleep(slow);
+        make(s);
+    });
+    h.getattr("/");
+    h.getattr("/d");
+    let _ = xattrs_supported(h.p_root());
+    std::thread::sleep(slow);
+    let _ = xattrs_supported(h.s_root());
+    h.getattr("/");
+    h.assert_no_mismatches();
+}
+
 /// A genuinely wrong mtime is still caught when nothing was slow.
 #[test]
 fn wrong_mtime_is_still_reported_with_a_small_tolerance() {

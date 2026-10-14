@@ -481,9 +481,26 @@ impl Engine {
         self.slack.get(id)
     }
 
+    /// The extra tolerance of the time checks of the object with this id ([`Slack`]): the widest window of an
+    /// operation that changed it, where that was wider than a tenth of `--time-tolerance`.
+    pub fn time_slack(&self, id: u64) -> Duration {
+        Duration::from_nanos(self.slack_of(id))
+    }
+
     /// Marks an object created by the current operation as changed by it.
     pub(crate) fn touched_new(id: u64) {
         TOUCHED.with(|t| t.borrow_mut().push(id));
+    }
+
+    /// Remembers the operation's window so far as the slack of every object it changed ([`Slack`]): right after
+    /// each of its halves, while it still holds the objects, and before a node it created is published. A stat that
+    /// waited for the objects runs the moment the operation lets go of them, before the operation itself returns;
+    /// recorded only then (as it was), the slack came too late for that stat, and a secondary that stamped a time
+    /// at the end of a slow half was reported as that much ahead of the primary.
+    pub(crate) fn record_slack(&self, cx: &Cx) {
+        if !is_read_only(cx.op) && cx.window_ns > self.cfg.time_tolerance.as_nanos() as u64 / 10 {
+            TOUCHED.with(|t| self.slack.record(&t.borrow(), cx.window_ns));
+        }
     }
 
     pub(crate) fn thorough(&self) -> bool {
@@ -623,6 +640,7 @@ impl Engine {
             cx.sec_errno = Some(r.as_ref().err().copied().unwrap_or(0));
             r
         });
+        self.record_slack(cx);
         (p.0, s)
     }
 
@@ -636,6 +654,7 @@ impl Engine {
         cx.window_ns = cx.window_ns.max(ns + cx.pns);
         self.stats.op(cx.op).secondary.record(ns);
         cx.sec_errno = Some(r.as_ref().err().copied().unwrap_or(0));
+        self.record_slack(cx);
         r
     }
 
@@ -988,9 +1007,7 @@ impl Engine {
             }
         }
         let total = t0.elapsed().as_nanos() as u64;
-        if !is_read_only(op) && cx.window_ns > self.cfg.time_tolerance.as_nanos() as u64 / 10 {
-            TOUCHED.with(|t| self.slack.record(&t.borrow(), cx.window_ns));
-        }
+        self.record_slack(&cx);
         let st = self.stats.op(op);
         st.count.fetch_add(1, Relaxed);
         st.total.record(total);

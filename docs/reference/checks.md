@@ -93,7 +93,11 @@ the execution window of the operation (from the common start to the later of
 the two halves). When that window is wider than a tenth of
 `--time-tolerance` (a slow secondary, a saturated machine), it is remembered
 for every object the operation changed, also after the kernel forgets the
-object, and added to the tolerance of its mtime and ctime checks. A slow
+object, and added to the tolerance of its mtime and ctime checks. It is
+remembered as soon as each half has returned, while the operation still
+holds its objects, and before the node of an object it created exists: a
+stat that waited for the operation runs the moment the operation lets go of
+them, before the operation itself has returned. A slow
 experimental file system therefore never causes timestamp false positives;
 it only loosens timestamp checks for the objects it was slow on.
 

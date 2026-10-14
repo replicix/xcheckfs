@@ -87,7 +87,15 @@ change against earlier results. Usage and the `results.json` format:
   `assert_trees_equal`). `HarnessBuilder::secondary_fault(fault)` installs a
   fault on the secondary before the engine starts, so that the mount-time
   probe sees it; a fault added with `Harness` afterwards comes too late for
-  the probe.
+  the probe. The two trees start with equal directory times (after
+  `build_with`'s seed, every directory of the secondary gets its primary
+  counterpart's times; files keep theirs, which seeds make differ on
+  purpose, so a seed's files on a slow secondary are as much later), and
+  `xattrs_supported` leaves the probed directory's times as they were: both
+  act behind the engine's back, one tree after the other.
+  `assert_trees_equal` reads the trees directly, but allows each object's
+  mtimes the engine's slack for it (`Engine::time_slack`) on top of its
+  2 s tolerance; `tree_diff(a, b, opts)` compares without it.
 
 ## Adding a test
 

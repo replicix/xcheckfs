@@ -167,6 +167,11 @@ impl HarnessBuilder {
         let ptmp = tmp_in(&self.pbase);
         let stmp = tmp_in(&self.sbase);
         seed(ptmp.path(), stmp.path());
+        // The two trees start with equal directory times: made (and seeded) one after the other, the secondary's
+        // directories would be as much later as the secondary was slow to fill them, and they are compared (the
+        // root's at mount, every directory's by its first stat). Files keep theirs: seeds make them differ on
+        // purpose (a repair of a wrong mtime).
+        copy_dir_times(ptmp.path(), stmp.path());
         let pbe: Arc<dyn Backend> = Arc::new(PosixBackend::open("primary", ptmp.path()).unwrap());
         let sbe: Arc<dyn Backend> = Arc::new(PosixBackend::open("secondary", stmp.path()).unwrap());
         let pfault = FaultBackend::new(pbe);
@@ -756,9 +761,14 @@ impl Harness {
         })
     }
 
-    /// Compares the two trees behind the engine's back (independent of the engine's own checks).
+    /// Compares the two trees behind the engine's back, by reading them directly. One input comes from the engine:
+    /// an object's mtimes may differ by its slack on top of the tolerance (an operation whose secondary half was
+    /// slow stamped it that much later there: `Engine::time_slack`); everything else is independent of the engine's
+    /// checks. [`tree_diff`] without the slack.
     pub fn tree_diff(&self) -> Vec<String> {
-        tree_diff(self.p_root(), self.s_root(), &TreeOpts::default())
+        tree_diff_with(self.p_root(), self.s_root(), &TreeOpts::default(), &|ino| {
+            self.engine.time_slack(self.engine.map_ino(ino))
+        })
     }
 
     #[track_caller]
@@ -813,15 +823,42 @@ pub fn raw_user_xattrs(path: &Path) -> std::io::Result<Vec<String>> {
     Ok(raw_listxattr(path)?.into_iter().filter(|n| n.starts_with("user.")).collect())
 }
 
-/// Whether `user.*` xattrs work in this directory.
+/// Whether `user.*` xattrs work in this directory. The directory keeps its times: probed behind the engine's back
+/// (the roots of a running harness, one after the other), a slow secondary root would otherwise be stamped later than
+/// the primary one.
 pub fn xattrs_supported(dir: &Path) -> bool {
+    let times = std::fs::metadata(dir).ok();
     let probe = dir.join(".xattr-probe");
     if std::fs::write(&probe, b"x").is_err() {
         return false;
     }
     let ok = raw_setxattr(&probe, "user.probe", b"1").is_ok();
     let _ = std::fs::remove_file(&probe);
+    if let Some(md) = times {
+        set_times(dir, &md);
+    }
     ok
+}
+
+/// Gives the directory `to` and each directory below it the atime and mtime of its counterpart in `from`, where
+/// that is a directory too (best effort; files and symlinks keep theirs).
+pub fn copy_dir_times(from: &Path, to: &Path) {
+    if let Ok(md) = std::fs::metadata(from) {
+        set_times(to, &md);
+    }
+    let Ok(rd) = std::fs::read_dir(from) else { return };
+    for e in rd.flatten() {
+        let (a, b) = (e.path(), to.join(e.file_name()));
+        let (Ok(ma), Ok(mb)) = (std::fs::symlink_metadata(&a), std::fs::symlink_metadata(&b)) else { continue };
+        if ma.is_dir() && mb.is_dir() {
+            copy_dir_times(&a, &b);
+        }
+    }
+}
+
+fn set_times(path: &Path, md: &std::fs::Metadata) {
+    let (Ok(atime), Ok(mtime)) = (md.accessed(), md.modified()) else { return };
+    let _ = std::fs::File::open(path).and_then(|f| f.set_times(std::fs::FileTimes::new().set_accessed(atime).set_modified(mtime)));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -877,6 +914,11 @@ fn hardlink_groups(t: &BTreeMap<PathBuf, Entry>) -> BTreeSet<Vec<PathBuf>> {
 
 /// Compares two directory trees; returns human-readable differences (empty = identical).
 pub fn tree_diff(a: &Path, b: &Path, o: &TreeOpts) -> Vec<String> {
+    tree_diff_with(a, b, o, &|_| Duration::ZERO)
+}
+
+/// [`tree_diff`], with `slack(ino of a)` added to the mtime tolerance of each object.
+pub fn tree_diff_with(a: &Path, b: &Path, o: &TreeOpts, slack: &dyn Fn(u64) -> Duration) -> Vec<String> {
     let (mut ta, mut tb) = (BTreeMap::new(), BTreeMap::new());
     walk(a, Path::new(""), &mut ta);
     walk(b, Path::new(""), &mut tb);
@@ -913,7 +955,7 @@ pub fn tree_diff(a: &Path, b: &Path, o: &TreeOpts) -> Vec<String> {
             d.push(format!("{name}: nlink {} vs {}", ma.nlink(), mb.nlink()));
         }
         if let Some(tol) = o.mtime
-            && (ma.mtime() - mb.mtime()).unsigned_abs() > tol.as_secs() {
+            && (ma.mtime() - mb.mtime()).unsigned_abs() > (tol + slack(ma.ino())).as_secs() {
                 d.push(format!("{name}: mtime {} vs {}", ma.mtime(), mb.mtime()));
             }
         if (ft.is_char_device() || ft.is_block_device()) && ma.rdev() != mb.rdev() {

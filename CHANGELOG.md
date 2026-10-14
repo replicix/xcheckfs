@@ -137,6 +137,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   type) no longer attaches the object to the secondary of another one when an
   ancestor was renamed meanwhile: it fails, and the next operation on the
   object compares and repairs it again.
+- False `attr mtime` mismatches with the secondary's mtime ahead of the
+  primary's by about as long as an operation's secondary half had taken
+  (stress runs over an experimental FUSE secondary on a loaded host: `/`,
+  `/a`, `/b` and files 1.2 to 6.7 s ahead, mostly right after a create in the
+  directory). The slack of an operation's window was recorded only when the
+  operation returned, after it had let go of its objects: a lookup or getattr
+  that had waited for them ran in between and compared their times without
+  it, and the secondary had stamped them at the end of its slow half. The
+  slack is now recorded right after each half, while the operation still
+  holds the objects, and for a created object before its node exists
+  ([Checks](docs/reference/checks.md#attributes)). Tests:
+  `a_stat_right_after_a_slow_operation_allows_for_its_window`,
+  `a_stat_of_an_object_a_slow_create_just_made_allows_for_its_window`. The
+  test harness's own comparison of the two trees allows for the slack too
+  (`Engine::time_slack`): a secondary half slower than its 2 s tolerance
+  failed a stress run with `trees differ: mtime` (test
+  `trees_compared_after_a_slow_write_allow_for_its_window`). And it starts
+  the two trees with equal times: it made and seeded them one after the
+  other, and probed the roots for xattrs the same way, behind the engine's
+  back, so at the start of a run a slow secondary's root (and seeded
+  directories) were as much later as it had been slow, which the mount and the
+  first stat of `/` reported (test
+  `the_harness_leaves_the_roots_with_equal_times`).
 - SELinux labels (`security.selinux`) are no longer compared by the live
   `listxattr`/`getxattr` checks (`verify` already skipped them): the policy
   assigns them per mount, so a FUSE secondary on an SELinux host, which has

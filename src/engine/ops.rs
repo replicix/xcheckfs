@@ -229,11 +229,14 @@ impl Engine {
         if let Some(sst) = &sst {
             self.cmp_stat(cx, &node, &pst, sst, excl, cx_what(cx.op))?;
         }
+        // The new object was stamped somewhere in this operation's window: its slack is known before its node,
+        // which a stat may find at once (the operation does not hold it).
+        if !super::is_read_only(cx.op) {
+            Engine::touched_new(id);
+            self.record_slack(cx);
+        }
         match self.nodes.insert_or_get(node) {
             Inserted::New(n) => {
-                if !super::is_read_only(cx.op) {
-                    Engine::touched_new(n.id);
-                }
                 self.stats.nodes.store(self.nodes.len() as u64, Relaxed);
                 Ok((n, attr))
             }
