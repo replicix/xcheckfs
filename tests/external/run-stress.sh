@@ -80,7 +80,9 @@ chmod 755 "$primary" "$secondary" "$mnt"
 # Different file systems differ legitimately ([Testing](docs/how-to-guides/development/TESTING.md#pitfalls)); with
 # STRESS_CROSS_FS=0|1 the detection (by file system type) can be forced. Then: directory link counts are not compared
 # (btrfs always reports 1), and the stressors that depend on fallocate modes (tmpfs refuses ZERO_RANGE and the like),
-# on large extended attributes (btrfs: ENOSPC) or on invalid UTF-8 names (ZFS: EILSEQ) are skipped.
+# on many or large extended attributes (ext4 keeps an inode's xattrs in one block, btrfs in one leaf: ENOSPC where
+# the other side takes them; docs/reference/fs-differences.md#reported-capability-and-capacity-limits) or on invalid
+# UTF-8 names (ZFS: EILSEQ) are skipped.
 pfs=$(stat -f -c %T "$primary" 2>/dev/null) sfs=$(stat -f -c %T "$secondary" 2>/dev/null)
 cross=${STRESS_CROSS_FS:-}
 [ -n "$cross" ] || { [ "$pfs" != "$sfs" ] && cross=1 || cross=0; }
@@ -89,7 +91,7 @@ skip_extra=
 if [ "$cross" = 1 ]; then
     mount_extra="$mount_extra --no-dir-nlink" verify_extra=--no-dir-nlink
     skip_extra="fallocate fpunch iomix"
-    case "$pfs $sfs" in *btrfs*) skip_extra="$skip_extra xattr" ;; esac     # setxattr of large values: ENOSPC
+    case "$pfs $sfs" in *btrfs* | *ext2/ext3*) skip_extra="$skip_extra xattr" ;; esac  # xattr space: ENOSPC (ext4 is "ext2/ext3")
     case "$pfs $sfs" in *zfs*) skip_extra="$skip_extra filename" ;; esac    # invalid UTF-8 names: EILSEQ
     # security.selinux labels follow the location (tmpfs: user_tmp_t, home: user_home_t); the live check does not see them
     [ -e /sys/fs/selinux/enforce ] && verify_extra="$verify_extra --no-xattrs"
