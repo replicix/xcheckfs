@@ -1102,6 +1102,10 @@ impl Engine {
             };
             let sec = !self.detached() && f.has_sec();
             let (p, s) = self.both(cx, sec, None, |side, be| be.lseek(f.fd(side).as_fd(), off, whence));
+            if whence == libc::SEEK_DATA && self.seek_data_granularity(f.pfd.as_fd(), off, &p, &s) {
+                tracing::debug!("lseek SEEK_DATA from {off}: {p:?} vs {s:?} (hole granularity, not a mismatch)");
+                return Ok(p?);
+            }
             self.cmp_result(cx, n, None, &p, &s, false)?;
             let po = p?;
             if let Some(Ok(so)) = s
@@ -1115,6 +1119,50 @@ impl Engine {
                 }
             Ok(po)
         })
+    }
+
+    /// Whether `SEEK_DATA` from `off` answering `ENXIO` on one side and an offset on the other is only a difference
+    /// of hole granularity. `ENXIO` says "no data from `off` to the end of the file"; a file system that tracks
+    /// holes more coarsely (whole chunks or records, or no holes at all: everything below the size is data) answers
+    /// with an offset in a range that the other knows to be a hole, typically a trailing hole after a punch or a
+    /// truncate that extended the file. Beyond the end of the file both must answer `ENXIO`.
+    ///
+    /// Primary `ENXIO`, secondary an offset: the reference has no data there, the secondary merely reports some
+    /// (what it holds is compared by reads). Primary an offset `d`, secondary `ENXIO`: the secondary claims a hole
+    /// where the reference reports data, which hides data from sparse-aware copies (`cp`, `tar`, `rsync -S`)
+    /// unless those bytes are zeros (an allocated, zeroed range); the primary's bytes from `d` up to its next hole
+    /// (at most `VERIFY_CAP` of them) must read as zeros.
+    fn seek_data_granularity(
+        &self,
+        pfd: std::os::fd::BorrowedFd<'_>,
+        off: i64,
+        p: &SysResult<i64>,
+        s: &Option<SysResult<i64>>,
+    ) -> bool {
+        let Ok(size) = self.b[0].stat(pfd).map(|st| st.size) else { return false };
+        let below_eof = |x: i64| off >= 0 && off <= x && (x as u64) < size;
+        match (p, s) {
+            (Err(libc::ENXIO), Some(Ok(so))) => below_eof(*so),
+            (Ok(po), Some(Err(libc::ENXIO))) if below_eof(*po) => {
+                let end = match self.b[0].lseek(pfd, *po, libc::SEEK_HOLE) {
+                    Ok(h) => (h as u64).min(size),
+                    Err(_) => return false,
+                };
+                let mut at = *po as u64;
+                let stop = end.min(at.saturating_add(VERIFY_CAP));
+                let mut buf = vec![0u8; (stop - at).min(1 << 20) as usize];
+                while at < stop {
+                    let want = buf.len().min((stop - at) as usize);
+                    match self.b[0].pread(pfd, &mut buf[..want], at) {
+                        Ok(0) => break,
+                        Ok(k) if buf[..k].iter().all(|&b| b == 0) => at += k as u64,
+                        _ => return false,
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

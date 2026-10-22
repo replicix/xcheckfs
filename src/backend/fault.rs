@@ -409,7 +409,7 @@ pub enum Effect {
     GetlkFree,
     /// getlk: report this lock instead of the real answer.
     GetlkResult(Lock),
-    /// lseek: return this offset.
+    /// lseek: return this offset (also where the inner backend answered an error, such as `ENXIO`).
     Offset(i64),
 }
 
@@ -1068,8 +1068,11 @@ impl Backend for FaultBackend {
 
     fn lseek(&self, file: BorrowedFd<'_>, off: i64, whence: i32) -> SysResult<i64> {
         self.exec(FaultOp::Lseek, &[], Some(file), None, |fx| {
-            let r = self.inner.lseek(file, off, whence)?;
-            Ok(fx.0.iter().find_map(|e| if let Effect::Offset(o) = e { Some(*o) } else { None }).unwrap_or(r))
+            let r = self.inner.lseek(file, off, whence);
+            match fx.0.iter().find_map(|e| if let Effect::Offset(o) = e { Some(*o) } else { None }) {
+                Some(o) => Ok(o),
+                None => r,
+            }
         })
     }
 

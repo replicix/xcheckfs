@@ -810,6 +810,45 @@ fn lseek_offset_fault() {
     h.assert_no_mismatches();
 }
 
+/// `SEEK_DATA` in a trailing hole: `ENXIO` where holes are tracked finely (tmpfs, ext4), an offset where they are
+/// tracked by chunk or record (a FUSE file system with 1 MiB chunks, ZFS). Granularity, not a mismatch; beyond the
+/// end of the file, or a secondary that hides nonzero data behind `ENXIO`, still is.
+#[test]
+fn seek_data_enxio_against_an_offset_is_granularity_below_eof_only() {
+    const MIB: i64 = 1 << 20;
+    let h = Harness::new(B, MismatchMode::Log);
+    let f = h.create("/g");
+    h.pwrite(f, 0, &data(4096));
+    h.truncate("/g", 4 * MIB as u64).unwrap();
+    h.assert_no_mismatches();
+    // the primary has no data from 3 MiB on; the secondary answers with the offset itself
+    let id = h.inject(Fault::new(FaultOp::Lseek, Effect::Offset(3 * MIB)));
+    assert_eq!(h.engine.lseek(&h.ctx, f.ino, f.fh, 3 * MIB, libc::SEEK_DATA), Err(libc::ENXIO));
+    h.assert_no_mismatches();
+    h.fault.remove(id);
+    // beyond the end of the file there is no data on any file system
+    let id = h.inject(Fault::new(FaultOp::Lseek, Effect::Offset(5 * MIB)));
+    assert_eq!(h.engine.lseek(&h.ctx, f.ino, f.fh, 5 * MIB, libc::SEEK_DATA), Err(libc::ENXIO));
+    let m = h.expect_mismatch(K::Result, None);
+    assert_eq!((m.op, m.primary.as_str(), m.secondary.as_str()), (OpKind::Lseek, "ENXIO", "OK"));
+    h.fault.remove(id);
+    // the secondary claims a hole where the primary has (nonzero) data
+    let h = Harness::new(B, MismatchMode::Log);
+    let f = h.create("/g");
+    h.pwrite(f, 0, &data(4096));
+    h.inject(Fault::new(FaultOp::Lseek, Effect::Errno(libc::ENXIO)));
+    assert_eq!(h.engine.lseek(&h.ctx, f.ino, f.fh, 0, libc::SEEK_DATA), Ok(0));
+    let m = h.expect_mismatch(K::Result, None);
+    assert_eq!((m.op, m.primary.as_str(), m.secondary.as_str()), (OpKind::Lseek, "OK", "ENXIO"));
+    // ... and where the primary's data are zeros
+    let h = Harness::new(B, MismatchMode::Log);
+    let f = h.create("/z");
+    h.pwrite(f, 0, &[0u8; 8192]);
+    h.inject(Fault::new(FaultOp::Lseek, Effect::Errno(libc::ENXIO)));
+    let _ = h.engine.lseek(&h.ctx, f.ino, f.fh, 0, libc::SEEK_DATA);
+    h.assert_no_mismatches();
+}
+
 #[test]
 fn delays_are_not_mismatches_and_are_visible_in_the_latency_statistics() {
     for level in [B, T, P] {

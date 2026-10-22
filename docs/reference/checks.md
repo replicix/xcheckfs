@@ -43,7 +43,7 @@ only a warning is logged: both agree, and the primary is trusted.
 | `release` | | | if the file was written: complete content comparison |
 | `fallocate` | result | attributes afterwards; for punch-hole and zero-range: the range reads as zeros (at most 16 MiB checked) | |
 | `copy_file_range` | result; bytes copied (the secondary is driven to the primary's count: short copies are legal) | the copied range read back is equal (at most 16 MiB checked) | |
-| `lseek` | result; offset (not for `SEEK_DATA`/`SEEK_HOLE`) | | |
+| `lseek` | result; offset (not for `SEEK_DATA`/`SEEK_HOLE`). `SEEK_DATA` below the end of the file answering `ENXIO` on one side and an offset on the other is hole granularity, not a mismatch, unless the secondary answers `ENXIO` where the primary's data from that offset to its next hole are not zeros | | |
 | `opendir` | result | | |
 | `readdir` | result; the listing at offset 0, as a set of (name, type) | | |
 | `setxattr` | result | the value reads back equal | |
@@ -174,7 +174,7 @@ is racy and the ordinary comparison always applies.
 | `statfs` values | capacities differ by nature; only the result is compared |
 | `security.selinux` | the label is assigned by the security policy for each mount, not kept by the file system (a FUSE secondary has none where an ext4 primary labels every inode). Reading, setting and removing it reach the primary only; `listxattr` compares the names without it, and `verify` skips it |
 | order of directory entries and of xattr names | file-system specific |
-| `SEEK_DATA` / `SEEK_HOLE` offsets | hole granularity is file-system specific |
+| `SEEK_DATA` / `SEEK_HOLE` offsets | hole granularity is file-system specific (so is `ENXIO` from `SEEK_DATA` in a trailing hole, see `lseek` above) |
 | pid of a conflicting lock | always reported as 0 |
 | `fsync` durability | not observable ([Limitations](limitations.md#not-covered)) |
 
