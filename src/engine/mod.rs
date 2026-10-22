@@ -857,6 +857,13 @@ impl Engine {
         if pe != se {
             // (what `report_at` tells a secondary fault by, whichever call this result came from)
             cx.sec_errno = Some(se);
+            // A change that took effect on one side only stamped that side's ctime and not the other's: the ctime
+            // baseline of the object (of the directory, for a name-based operation) no longer pairs two equal
+            // histories, and the next stat would report the consequence of this mismatch as a second one
+            // ("ctime changed on one side only"). The next stat starts a new baseline.
+            if !is_read_only(cx.op) {
+                *node.ctimes.lock() = None;
+            }
             // (a name-based operation's object is the entry, not `node`, its parent)
             let detail = if name.is_none() { format!("on a {}", node.kind.name()) } else { String::new() };
             self.report_at(

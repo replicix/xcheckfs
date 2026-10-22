@@ -810,6 +810,30 @@ fn lseek_offset_fault() {
     h.assert_no_mismatches();
 }
 
+/// A change that succeeds on one side only (ext4's xattr space is full, the secondary still takes the xattr) moves
+/// that side's ctime only: one mismatch (the result), not a second one at the next stat ("ctime changed on one side
+/// only", seen after stress-ng xattr with an ext4 primary). A ctime that moves on one side for no reason afterwards
+/// is still reported.
+#[test]
+fn one_sided_change_is_not_reported_again_as_a_one_sided_ctime() {
+    let h = Harness::builder().config(|c| c.time_tolerance = std::time::Duration::from_millis(30)).build();
+    if !xattr_ok(&h) {
+        return;
+    }
+    h.write_file("/f", b"x");
+    h.getattr("/f"); // remember the ctimes
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    h.inject(Fault::new(FaultOp::Setxattr, Effect::Errno(libc::ENOSPC)).once());
+    let _ = h.setxattr("/f", "user.k", b"v");
+    let m = h.expect_mismatch(K::Result, Some("user.k"));
+    assert_eq!((m.op, m.primary.as_str(), m.secondary.as_str()), (OpKind::Setxattr, "OK", "ENOSPC"));
+    h.getattr("/f");
+    assert!(h.find_mismatch(K::Attr, Some("ctime")).is_none(), "{}", h.describe_mismatches());
+    h.inject(Fault::new(FaultOp::Stat, Effect::Stat(StatLie::CtimeShift(60))).path("/f").once());
+    h.getattr("/f");
+    h.expect_mismatch(K::Attr, Some("ctime"));
+}
+
 /// `SEEK_DATA` in a trailing hole: `ENXIO` where holes are tracked finely (tmpfs, ext4), an offset where they are
 /// tracked by chunk or record (a FUSE file system with 1 MiB chunks, ZFS). Granularity, not a mismatch; beyond the
 /// end of the file, or a secondary that hides nonzero data behind `ENXIO`, still is.

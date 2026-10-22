@@ -86,7 +86,11 @@ xcheckfs remembers the last ctime pair of each object and reports `attr ctime`
 ("ctime changed on one side only") when one side's ctime moved by more than
 `--time-tolerance` while the other did not move at all. The same happens when
 a secondary is modified behind xcheckfs's back
-([Limitations](limitations.md#exclusive-access)).
+([Limitations](limitations.md#exclusive-access)). A change that succeeded on
+one side only (a `result` mismatch of a modifying operation, allowed or not)
+moved that side's ctime only: it starts a new ctime pair for the object (for
+the directory, when the operation is about a name in it), so that its
+consequence is not reported a second time.
 
 **Slack.** Each file system stamps a changed object's times somewhere inside
 the execution window of the operation (from the common start to the later of
