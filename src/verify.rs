@@ -137,6 +137,7 @@ pub fn verify(
             time_tolerance: opts.time_tolerance,
             dir_nlink: opts.dir_nlink && ps.nlink != 1 && ss.nlink != 1,
             mtime: opts.mtime,
+            time_range: None,
         },
         p_dev: ps.dev,
         s_dev: ss.dev,

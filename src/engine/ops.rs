@@ -489,7 +489,9 @@ impl Engine {
             if let Some(Ok(sst)) = &s {
                 self.cmp_stat(cx, &n, &pst, sst, true, "after setattr")?;
                 if self.thorough() {
-                    let check = |st: &Stat| -> Result<(), String> {
+                    // A time beyond a side's range reads back as that side's limit (see `probe::Adapt::time_ranges`).
+                    let ranges = self.adapt.time_ranges;
+                    let check = |st: &Stat, range: Option<(sys::Ts, sys::Ts)>| -> Result<(), String> {
                         let mut bad = Vec::new();
                         if let Some(m) = a.mode {
                             // setgid may legitimately be dropped by the kernel
@@ -507,16 +509,17 @@ impl Engine {
                             bad.push(format!("size {} != requested {}", st.size, a.size.unwrap()));
                         }
                         if let Some(TimeSpec::Set(t)) = a.mtime
-                            && st.mtime != t {
+                            && st.mtime != compare::clamp_time(t, range) {
                                 bad.push(format!("mtime {} != requested {t}", st.mtime));
                             }
                         if let Some(TimeSpec::Set(t)) = a.atime
-                            && st.atime != t {
+                            && st.atime != compare::clamp_time(t, range) {
                                 bad.push(format!("atime {} != requested {t}", st.atime));
                             }
                         if bad.is_empty() { Ok(()) } else { Err(bad.join(", ")) }
                     };
-                    self.verify_sides(cx, &n, None, "setattr applied", check(&pst), Some(check(sst)), true)?;
+                    let (pr, sr) = (ranges.map(|r| r.0), ranges.map(|r| r.1));
+                    self.verify_sides(cx, &n, None, "setattr applied", check(&pst, pr), Some(check(sst, sr)), true)?;
                 }
             }
             Ok(Attr { id: n.id, st: pst })

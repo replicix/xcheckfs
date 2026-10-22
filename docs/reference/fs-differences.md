@@ -84,12 +84,13 @@ into data, a write) is still reported.
 | Only one side stamps the mtime of directories exchanged between parents (`RENAME_EXCHANGE`: xfs and f2fs). | After the exchange, aligns both directories. |
 | Only one side stamps mtime for a truncate to the current size (ext4 and f2fs do; xfs and btrfs do not; tmpfs does for a non-empty file only). | After a `setattr` with a size equal to the primary's size before, and without an explicit mtime in the same `setattr`, aligns the file. Path truncate and `ftruncate`, of an empty and of a non-empty file, are probed separately and aligned only for the variant that differs (all five measured file systems stamp for `ftruncate`). |
 | Only one side stamps mtime when a hole is punched into a range that holds no data (btrfs and ZFS do not; ext4, xfs, f2fs and tmpfs do). Seen with InnoDB page compression, tmpfs primary, ZFS secondary. | After a `fallocate` `PUNCH_HOLE` whose range held no data on the primary, aligns the file. That `fallocate` takes the file exclusively under `--serialize relaxed`, so that no concurrent write stamps mtime in between. Formerly an allow rule on `attr` `mtime` and `ctime` of `fallocate`. |
+| The range of times a file system can store differs: Linux clamps a time set beyond it to the limit (ext4: 1901 to 2446, so `utimensat` to 2^36 s reads back as 15032385535; an experimental FUSE file system that keeps signed 64-bit nanoseconds: 1677 to 2262, 9223372036.854775807). Seen with stress-ng `utime`, ext4 primary. | The probe sets a scratch file's mtime far beyond both ends and reads back each side's limits (a read-back that is no plausible limit, such as a time stored wrapped around, is not adapted to). mtimes are then compared clamped to the range both can store, and the `thorough` read-back of an explicit time expects the side's own limit when the time lies beyond it. Logged at mount; `xcheckfs verify` has no probe and still reports such mtimes. |
 | `copy_file_range` may copy less than asked, and file systems differ in how much one call copies (xfs and btrfs vs ext4 and tmpfs). | The primary runs first; the secondary is then driven to exactly the primary's count (repeating its own short copies). Only a secondary that cannot get there is reported (`length`). |
 | `SEEK_DATA`/`SEEK_HOLE` granularity, `st_blocks`, directory sizes, atime, statfs numbers. | Never compared ([Checks](checks.md#never-compared)). This includes `SEEK_DATA` from an offset in a trailing hole (after a punch, or a truncate that extended the file): `ENXIO` where holes are tracked by page or block (tmpfs, ext4), the offset itself where they are tracked by record or chunk (ZFS, a FUSE file system with 1 MiB chunks). |
 
-With `--no-probe` nothing in the first five rows is adapted to (except the
+With `--no-probe` nothing in the first six rows is adapted to (except the
 btrfs fallback): the differences are reported as `attr` `mtime` and `nlink`
-mismatches.
+mismatches (and `verify` `setattr applied` for a time beyond one side's range).
 
 ## Reported: capability and capacity limits
 

@@ -41,6 +41,12 @@ pub struct Behavior {
     /// POSIX ACLs (`system.posix_acl_*` xattrs): reading the access ACL of a file without one answers `ENODATA`
     /// where they are supported, `EOPNOTSUPP` where not (a FUSE file system that does not enable them).
     pub posix_acl: Option<bool>,
+    /// The times it can store, `(earliest, latest)`: what an `mtime` set far beyond either end reads back as
+    /// (Linux clamps such a time to the file system's limits; ext4: 1901 to 2446, a FUSE file system that keeps
+    /// signed 64-bit nanoseconds: 1677 to 2262). `None` when the read-back is not a plausible limit (a file system
+    /// that stores a wrapped time is not adapted to).
+    #[serde(skip)]
+    pub time_range: Option<(Ts, Ts)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -93,6 +99,16 @@ pub struct Adapt {
     pub truncate_same_size_mtime: TruncateAdapt,
     /// The same after punching a hole into a range that held no data on the primary.
     pub punch_hole_in_hole_mtime: bool,
+    /// The two file systems store different time ranges: `(primary, secondary)`. mtimes are compared clamped to
+    /// the common range, and a time set beyond a side's range is expected to read back as that side's limit.
+    pub time_ranges: Option<((Ts, Ts), (Ts, Ts))>,
+}
+
+impl Adapt {
+    /// The range of times both sides can store, when their ranges differ.
+    pub fn common_time_range(&self) -> Option<(Ts, Ts)> {
+        self.time_ranges.map(|((plo, phi), (slo, shi))| (plo.max(slo), phi.min(shi)))
+    }
 }
 
 impl Adapt {
@@ -150,6 +166,18 @@ impl Adapt {
                 s.punch_hole_in_hole_mtime,
                 "of a file when a hole is punched where it holds no data",
             ),
+            time_ranges: match (p.time_range, s.time_range) {
+                (Some(a), Some(b)) if a != b => {
+                    notes.push(format!(
+                        "the file systems store different time ranges (primary {} to {}, secondary {} to {}): \
+                         mtimes are compared within the common range, and a time set beyond a side's range is \
+                         expected to read back as that side's limit",
+                        a.0, a.1, b.0, b.1
+                    ));
+                    Some((a, b))
+                }
+                _ => None,
+            },
         };
         (adapt, notes)
     }
@@ -237,7 +265,24 @@ fn run(be: &dyn Backend, d: BorrowedFd<'_>) -> Behavior {
         insert_range: falloc_supported(be, d, "fi", libc::FALLOC_FL_INSERT_RANGE),
     };
     b.posix_acl = posix_acl(be, d);
+    b.time_range = time_range(be, d);
     b
+}
+
+/// Far beyond any file system's range, still representable everywhere (`timespec`, `SystemTime`).
+const FAR: i64 = 1 << 40;
+
+fn time_range(be: &dyn Backend, d: BorrowedFd<'_>) -> Option<(Ts, Ts)> {
+    let (node, _) = file(be, d, "tr", 0).ok()?;
+    let read_back = |sec: i64| -> Option<Ts> {
+        be.utimens(node.as_fd(), FileKind::Regular, None, TimeSpec::Omit, TimeSpec::Set(Ts { sec, nsec: 0 })).ok()?;
+        Some(be.stat(node.as_fd()).ok()?.mtime)
+    };
+    let (hi, lo) = (read_back(FAR)?, read_back(-FAR)?);
+    // A limit lies between the request and the epoch, and no file system in use ends before 2038 or starts after
+    // 1970: anything else is a time stored wrongly, which must be reported, not adapted to.
+    let plausible = hi.sec >= i32::MAX as i64 && hi.sec <= FAR && lo.sec <= 0 && lo.sec >= -FAR;
+    plausible.then_some((lo, hi))
 }
 
 fn posix_acl(be: &dyn Backend, d: BorrowedFd<'_>) -> Option<bool> {

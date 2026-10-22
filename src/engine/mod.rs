@@ -320,6 +320,7 @@ impl Engine {
             time_tolerance: cfg.time_tolerance,
             dir_nlink: cfg.dir_nlink && !btrfs && !adapt.no_dir_nlink,
             mtime: true,
+            time_range: adapt.common_time_range(),
         };
         let root = Node::new(
             ROOT_ID,

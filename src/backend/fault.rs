@@ -370,6 +370,9 @@ pub enum Effect {
     /// rename: a directory that moved to another parent (both, for `RENAME_EXCHANGE`) gets its mtime set to now
     /// (a file system that stamps it, which POSIX allows).
     StampMtime,
+    /// utimens: an explicit time outside `(earliest, latest)` is stored as that limit (a file system with a smaller
+    /// time range: Linux clamps to what the file system can store).
+    ClampTimes(Ts, Ts),
 
     // ---- attributes
     /// stat / stat_at / lookup: falsify the returned attributes.
@@ -860,7 +863,14 @@ impl Backend for FaultBackend {
         atime: TimeSpec,
         mtime: TimeSpec,
     ) -> SysResult<()> {
-        self.exec_unit(FaultOp::Utimens, &[], Some(node), |_| self.installs(node, self.inner.utimens(node, kind, file, atime, mtime)))
+        self.exec_unit(FaultOp::Utimens, &[], Some(node), |fx| {
+            let range = fx.0.iter().find_map(|e| if let Effect::ClampTimes(lo, hi) = e { Some((*lo, *hi)) } else { None });
+            let clamp = |t: TimeSpec| match (t, range) {
+                (TimeSpec::Set(t), Some((lo, hi))) => TimeSpec::Set(t.clamp(lo, hi)),
+                (t, _) => t,
+            };
+            self.installs(node, self.inner.utimens(node, kind, file, clamp(atime), clamp(mtime)))
+        })
     }
 
     fn readlink(&self, node: BorrowedFd<'_>) -> SysResult<Vec<u8>> {

@@ -22,6 +22,18 @@ pub struct AttrRules {
     /// Compare mtime absolutely (disabled for trees whose mtimes are known
     /// to differ, e.g. by `verify --no-mtime`).
     pub mtime: bool,
+    /// The range of times both file systems can store, `(earliest, latest)`, when their ranges differ (learned by
+    /// the mount-time probe): each side clamps a time set beyond its own range to its own limit, so mtimes are
+    /// compared clamped to this common range.
+    pub time_range: Option<(Ts, Ts)>,
+}
+
+/// `t` clamped to `range` (unchanged without one).
+pub fn clamp_time(t: Ts, range: Option<(Ts, Ts)>) -> Ts {
+    match range {
+        Some((lo, hi)) => t.clamp(lo, hi),
+        None => t,
+    }
 }
 
 /// Compares two stats of the same object.
@@ -56,7 +68,7 @@ pub fn diff_stat(p: &Stat, s: &Stat, r: &AttrRules) -> Vec<AttrDiff> {
     if matches!(kp, FileKind::CharDev | FileKind::BlockDev) && p.rdev != s.rdev {
         push("rdev", format!("{:#x}", p.rdev), format!("{:#x}", s.rdev));
     }
-    if r.mtime && !times_close(&p.mtime, &s.mtime, r.time_tolerance) {
+    if r.mtime && !times_close(&clamp_time(p.mtime, r.time_range), &clamp_time(s.mtime, r.time_range), r.time_tolerance) {
         push("mtime", p.mtime.to_string(), s.mtime.to_string());
     }
     d
@@ -208,7 +220,7 @@ mod tests {
     fn st(mode: u32, size: u64, mtime: i64) -> Stat {
         Stat { mode, size, nlink: 1, mtime: Ts { sec: mtime, nsec: 0 }, ..Default::default() }
     }
-    const R: AttrRules = AttrRules { time_tolerance: Duration::from_secs(1), dir_nlink: true, mtime: true };
+    const R: AttrRules = AttrRules { time_tolerance: Duration::from_secs(1), dir_nlink: true, mtime: true, time_range: None };
 
     #[test]
     fn stat_diffs() {

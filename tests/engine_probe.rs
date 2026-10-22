@@ -208,3 +208,44 @@ fn the_probe_leaves_no_trace() {
     h.write_file("/f", b"works");
     h.assert_no_mismatches();
 }
+
+/// A time beyond what a file system can store is clamped to its limit (Linux), and limits differ: ext4 stores 1901
+/// to 2446, a FUSE file system that keeps signed 64-bit nanoseconds 1677 to 2262 (stress-ng utime sets 2^34-1 to
+/// 2^36-1 s). The probe learns both ranges: mtimes are compared within the common one, and a side's own limit is
+/// what its read-back must show. A file system that stores a time wrapped around (here: as 0) is still reported.
+#[test]
+fn different_time_ranges() {
+    use xcheckfs::sys::Ts;
+    let ns64 = (Ts { sec: -9_223_372_037, nsec: 145_224_192 }, Ts { sec: 9_223_372_036, nsec: 854_775_807 });
+    // (decided from the primary's file system itself, not from what the engine learned)
+    let t = tempfile::NamedTempFile::new_in(test_bases().0).unwrap();
+    let far = libc::timespec { tv_sec: (1 << 36) - 1, tv_nsec: 0 };
+    let path = std::ffi::CString::new(t.path().as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: valid path and times.
+    assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), [far, far].as_ptr(), 0) }, 0);
+    if std::fs::metadata(t.path()).unwrap().mtime() <= ns64.1.sec {
+        eprintln!("SKIP: the primary's file system stores no time beyond 2262");
+        return;
+    }
+    for probe in [true, false] {
+        let h = rig(probe, Fault::new(FaultOp::Utimens, Effect::ClampTimes(ns64.0, ns64.1)));
+        assert_eq!(adapted(&h, "time ranges"), probe, "{:?}", h.engine.adaptations());
+        h.write_file("/f", b"x");
+        h.set_mtime("/f", (1 << 36) - 1).unwrap();
+        h.getattr("/f");
+        h.lookup("/f");
+        if probe {
+            h.assert_no_mismatches();
+            // within the common range nothing changes
+            h.set_mtime("/f", 1 << 33).unwrap();
+            h.assert_no_mismatches();
+        } else {
+            h.expect_mismatch(K::Attr, Some("mtime"));
+        }
+    }
+    let h = rig(true, Fault::new(FaultOp::Utimens, Effect::ClampTimes(Ts { sec: 0, nsec: 0 }, Ts { sec: 0, nsec: 0 })));
+    assert!(!adapted(&h, "time ranges"), "{:?}", h.engine.adaptations());
+    h.write_file("/f", b"x");
+    h.set_mtime("/f", (1 << 36) - 1).unwrap();
+    h.expect_mismatch(K::Attr, Some("mtime"));
+}
